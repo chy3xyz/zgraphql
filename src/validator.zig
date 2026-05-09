@@ -1,0 +1,908 @@
+const std = @import("std");
+const ast = @import("ast.zig");
+const schema = @import("schema.zig");
+
+pub const ValidationError = struct {
+    message: []const u8,
+    line: ?usize = null,
+    col: ?usize = null,
+};
+
+pub const ValidationResult = struct {
+    errors: std.array_list.Managed(ValidationError),
+
+    pub fn init(allocator: std.mem.Allocator) ValidationResult {
+        return .{ .errors = std.array_list.Managed(ValidationError).init(allocator) };
+    }
+
+    pub fn deinit(self: *ValidationResult) void {
+        self.errors.deinit();
+    }
+
+    pub fn isValid(self: ValidationResult) bool {
+        return self.errors.items.len == 0;
+    }
+
+    pub fn addError(self: *ValidationResult, message: []const u8, line: ?usize, col: ?usize) !void {
+        try self.errors.append(.{ .message = message, .line = line, .col = col });
+    }
+};
+
+pub const Validator = struct {
+    allocator: std.mem.Allocator,
+    schema_def: *schema.Schema,
+    result: ValidationResult,
+    fragments: std.StringHashMap(*ast.FragmentDefinition),
+    variables: std.StringHashMap(*ast.Type),
+
+    pub fn init(allocator: std.mem.Allocator, schema_def: *schema.Schema) Validator {
+        return .{
+            .allocator = allocator,
+            .schema_def = schema_def,
+            .result = ValidationResult.init(allocator),
+            .fragments = std.StringHashMap(*ast.FragmentDefinition).init(allocator),
+            .variables = std.StringHashMap(*ast.Type).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Validator) void {
+        self.result.deinit();
+        self.fragments.deinit();
+        var var_iter = self.variables.iterator();
+        while (var_iter.next()) |entry| {
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.variables.deinit();
+    }
+
+    pub fn validate(self: *Validator, doc: *ast.Document) !ValidationResult {
+        self.result = ValidationResult.init(self.allocator);
+
+        // Collect fragments
+        for (doc.definitions.items) |*def| {
+            switch (def.*) {
+                .fragment => |*frag| {
+                    if (self.fragments.contains(frag.name)) {
+                        try self.result.addError("Fragment name must be unique", frag.line, frag.col);
+                    } else {
+                        try self.fragments.put(frag.name, frag);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Detect fragment cycles
+        var visited = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var viter = visited.iterator();
+            while (viter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            visited.deinit();
+        }
+
+        var frag_iter = self.fragments.iterator();
+        while (frag_iter.next()) |entry| {
+            try self.detectFragmentCycles(entry.key_ptr.*, entry.value_ptr.*, &visited);
+        }
+
+        // Validate definitions
+        for (doc.definitions.items) |*def| {
+            switch (def.*) {
+                .operation => |*op| try self.validateOperation(op),
+                .fragment => |*frag| try self.validateFragment(frag),
+            }
+        }
+
+        return self.result;
+    }
+
+    fn detectFragmentCycles(self: *Validator, frag_name: []const u8, frag: *ast.FragmentDefinition, visited: *std.StringHashMap(void)) ValidateError!void {
+        if (visited.contains(frag_name)) {
+            try self.result.addError("Fragment spread forms a cycle", null, null);
+            return;
+        }
+
+        const key = try self.allocator.dupe(u8, frag_name);
+        try visited.put(key, {});
+        defer {
+            _ = visited.remove(key);
+            self.allocator.free(key);
+        }
+
+        try self.detectFragmentCyclesInSelectionSet(&frag.selection_set, visited);
+    }
+
+    fn detectFragmentCyclesInSelectionSet(self: *Validator, ss: *ast.SelectionSet, visited: *std.StringHashMap(void)) ValidateError!void {
+        for (ss.selections.items) |*sel| {
+            switch (sel.*) {
+                .fragment_spread => |*fs| {
+                    if (self.fragments.get(fs.name)) |target_frag| {
+                        try self.detectFragmentCycles(fs.name, target_frag, visited);
+                    }
+                },
+                .inline_fragment => |*ifrag| {
+                    try self.detectFragmentCyclesInSelectionSet(&ifrag.selection_set, visited);
+                },
+                .field => |*field| {
+                    if (field.selection_set) |*fss| {
+                        try self.detectFragmentCyclesInSelectionSet(fss, visited);
+                    }
+                },
+            }
+        }
+    }
+
+    fn validateOperation(self: *Validator, op: *ast.OperationDefinition) !void {
+        const root_type = switch (op.op_type) {
+            .query => self.schema_def.query_type,
+            .mutation => self.schema_def.mutation_type orelse {
+                try self.result.addError("Schema does not support mutations", op.line, op.col);
+                return;
+            },
+            .subscription => self.schema_def.subscription_type orelse {
+                try self.result.addError("Schema does not support subscriptions", op.line, op.col);
+                return;
+            },
+        };
+
+        // Collect variables
+        for (op.variable_definitions.items) |*vd| {
+            if (self.variables.contains(vd.name)) {
+                try self.result.addError("Variable name must be unique within operation", null, null);
+            } else {
+                const var_type = try self.allocator.create(ast.Type);
+                var_type.* = try self.convertTypeRef(&vd.var_type);
+                try self.variables.put(vd.name, var_type);
+            }
+        }
+
+        const op_location: schema.DirectiveLocation = switch (op.op_type) {
+            .query => .query,
+            .mutation => .mutation,
+            .subscription => .subscription,
+        };
+        try self.validateDirectives(op.directives, op_location);
+
+        try self.validateSelectionSet(&op.selection_set, root_type);
+
+        // Clean up variables for this operation
+        var iter = self.variables.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.variables.clearRetainingCapacity();
+    }
+
+    fn validateFragment(self: *Validator, frag: *ast.FragmentDefinition) !void {
+        const type_name = frag.type_condition.name;
+        const frag_type = self.schema_def.getType(type_name);
+        if (frag_type == null) {
+            try self.result.addError("Fragment type condition does not exist in schema", frag.line, frag.col);
+            return;
+        }
+        try self.validateDirectives(frag.directives, .fragment_definition);
+        try self.validateSelectionSet(&frag.selection_set, frag_type.?);
+    }
+
+    const ValidateError = std.mem.Allocator.Error || error{UnexpectedToken};
+
+    fn validateSelectionSet(self: *Validator, ss: *ast.SelectionSet, parent_type: *schema.Type) ValidateError!void {
+        if (!parent_type.isComposite()) {
+            try self.result.addError("Selection set only allowed on composite types", null, null);
+            return;
+        }
+
+        for (ss.selections.items) |*sel| {
+            switch (sel.*) {
+                .field => |*field| try self.validateField(field, parent_type),
+                .fragment_spread => |*fs| try self.validateFragmentSpread(fs, parent_type),
+                .inline_fragment => |*ifrag| try self.validateInlineFragment(ifrag, parent_type),
+            }
+        }
+    }
+
+    fn validateField(self: *Validator, field: *ast.Field, parent_type: *schema.Type) ValidateError!void {
+        const field_def = parent_type.getField(field.name);
+        if (field_def == null) {
+            try self.result.addError("Field does not exist on type", field.line, field.col);
+            return;
+        }
+
+        try self.validateDirectives(field.directives, .field);
+
+        // Validate arguments
+        for (field.arguments.items) |arg| {
+            const arg_def = field_def.?.arguments.get(arg.name);
+            if (arg_def == null) {
+                try self.result.addError("Unknown argument", null, null);
+                continue;
+            }
+            try self.validateArgumentValue(arg.value, arg_def.?.value_type);
+        }
+
+        // Validate sub-selection
+        if (field.selection_set) |*ss| {
+            const field_type_name = field_def.?.field_type.innerTypeName();
+            const field_type = self.schema_def.getType(field_type_name);
+            if (field_type) |ft| {
+                try self.validateSelectionSet(ss, ft);
+            }
+        }
+    }
+
+    fn validateFragmentSpread(self: *Validator, fs: *ast.FragmentSpread, parent_type: *schema.Type) ValidateError!void {
+        try self.validateDirectives(fs.directives, .fragment_spread);
+        const frag = self.fragments.get(fs.name);
+        if (frag == null) {
+            try self.result.addError("Fragment not defined", fs.line, fs.col);
+            return;
+        }
+        // Check fragment type condition is applicable to parent type
+        const frag_type = self.schema_def.getType(frag.?.type_condition.name);
+        if (frag_type) |ft| {
+            if (!self.isTypeSubType(parent_type, ft)) {
+                try self.result.addError("Fragment type condition not applicable here", fs.line, fs.col);
+            }
+        }
+    }
+
+    fn validateInlineFragment(self: *Validator, ifrag: *ast.InlineFragment, parent_type: *schema.Type) ValidateError!void {
+        try self.validateDirectives(ifrag.directives, .inline_fragment);
+        if (ifrag.type_condition) |tc| {
+            const tc_type = self.schema_def.getType(tc.name);
+            if (tc_type == null) {
+                try self.result.addError("Inline fragment type condition does not exist", ifrag.line, ifrag.col);
+                return;
+            }
+            if (!self.isTypeSubType(parent_type, tc_type.?)) {
+                try self.result.addError("Inline fragment type condition not applicable here", ifrag.line, ifrag.col);
+            }
+            try self.validateSelectionSet(&ifrag.selection_set, tc_type.?);
+        } else {
+            try self.validateSelectionSet(&ifrag.selection_set, parent_type);
+        }
+    }
+
+    fn validateDirectives(self: *Validator, directives: std.array_list.Managed(ast.Directive), location: schema.DirectiveLocation) ValidateError!void {
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer seen.deinit();
+
+        for (directives.items) |dir| {
+            // Check if directive is defined in schema
+            const def = self.schema_def.getDirective(dir.name);
+            if (def == null) {
+                try self.result.addError("Unknown directive", dir.line, dir.col);
+                continue;
+            }
+
+            // Check location validity
+            var location_valid = false;
+            for (def.?.locations.items) |loc| {
+                if (loc == location) {
+                    location_valid = true;
+                    break;
+                }
+            }
+            if (!location_valid) {
+                try self.result.addError("Directive not valid in this location", dir.line, dir.col);
+            }
+
+            // Check repeatability
+            if (!def.?.is_repeatable) {
+                if (seen.contains(dir.name)) {
+                    try self.result.addError("Directive is not repeatable", dir.line, dir.col);
+                }
+                try seen.put(dir.name, {});
+            }
+
+            // Validate arguments against directive definition
+            for (dir.arguments.items) |arg| {
+                const arg_def = def.?.arguments.get(arg.name);
+                if (arg_def == null) {
+                    try self.result.addError("Unknown argument on directive", dir.line, dir.col);
+                    continue;
+                }
+            }
+
+            // Check required arguments
+            var aiter = def.?.arguments.iterator();
+            while (aiter.next()) |entry| {
+                const arg_name = entry.key_ptr.*;
+                const arg_def = entry.value_ptr.*;
+                if (arg_def.value_type.isNonNull()) {
+                    var found = false;
+                    for (dir.arguments.items) |a| {
+                        if (std.mem.eql(u8, a.name, arg_name)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        try self.result.addError("Missing required argument on directive", dir.line, dir.col);
+                    }
+                }
+            }
+
+            // Specific checks for built-in directives
+            if (std.mem.eql(u8, dir.name, "skip") or std.mem.eql(u8, dir.name, "include")) {
+                for (dir.arguments.items) |arg| {
+                    if (std.mem.eql(u8, arg.name, "if")) {
+                        switch (arg.value) {
+                            .variable => |var_name| {
+                                if (!self.variables.contains(var_name)) {
+                                    try self.result.addError("Variable not defined in directive argument", null, null);
+                                }
+                            },
+                            .boolean_value => {},
+                            else => try self.result.addError("Directive 'if' argument must be a boolean or variable", null, null),
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn isTypeSubType(self: *Validator, parent: *schema.Type, maybe_subtype: *schema.Type) bool {
+        _ = self;
+        if (parent.name.len == maybe_subtype.name.len and
+            std.mem.eql(u8, parent.name, maybe_subtype.name)) return true;
+        if (parent.isObject() and maybe_subtype.isInterface()) {
+            for (parent.kind.object.interfaces.items) |iface| {
+                if (std.mem.eql(u8, iface, maybe_subtype.name)) return true;
+            }
+        }
+        if (parent.isUnion()) {
+            for (parent.kind.union_type.possible_types.items) |pt| {
+                if (std.mem.eql(u8, pt, maybe_subtype.name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn isVariableTypeCompatible(self: *Validator, var_type: ast.Type, expected: schema.TypeRef) bool {
+        switch (var_type) {
+            .named => |n| {
+                return expected.kind == .named and std.mem.eql(u8, n.name, expected.kind.named);
+            },
+            .non_null => |ptr| {
+                if (expected.kind != .non_null) return false;
+                return self.isVariableTypeCompatible(ptr.*, expected.kind.non_null.*);
+            },
+            .list => |ptr| {
+                if (expected.kind != .list) return false;
+                return self.isVariableTypeCompatible(ptr.*, expected.kind.list.*);
+            },
+        }
+    }
+
+    fn validateArgumentValue(self: *Validator, value: ast.AstValue, expected_type: schema.TypeRef) ValidateError!void {
+        switch (value) {
+            .variable => |var_name| {
+                const var_type_ptr = self.variables.get(var_name);
+                if (var_type_ptr == null) {
+                    try self.result.addError("Variable not defined", null, null);
+                    return;
+                }
+                if (!self.isVariableTypeCompatible(var_type_ptr.?.*, expected_type)) {
+                    try self.result.addError("Variable type does not match expected argument type", null, null);
+                }
+            },
+            .null_value => {
+                if (expected_type.isNonNull()) {
+                    try self.result.addError("Null value for non-null argument", null, null);
+                }
+            },
+            .int_value => {
+                const inner = expected_type.innerTypeName();
+                if (!std.mem.eql(u8, inner, "Int") and
+                    !std.mem.eql(u8, inner, "Float") and
+                    !std.mem.eql(u8, inner, "ID"))
+                {
+                    try self.result.addError("Int value for non-numeric argument", null, null);
+                }
+            },
+            .float_value => {
+                const inner = expected_type.innerTypeName();
+                if (!std.mem.eql(u8, inner, "Float")) {
+                    try self.result.addError("Float value for non-float argument", null, null);
+                }
+            },
+            .string_value => {
+                const inner = expected_type.innerTypeName();
+                if (!std.mem.eql(u8, inner, "String") and
+                    !std.mem.eql(u8, inner, "ID"))
+                {
+                    try self.result.addError("String value for non-string argument", null, null);
+                }
+            },
+            .boolean_value => {
+                const inner = expected_type.innerTypeName();
+                if (!std.mem.eql(u8, inner, "Boolean")) {
+                    try self.result.addError("Boolean value for non-boolean argument", null, null);
+                }
+            },
+            .enum_value => |name| {
+                const inner = expected_type.innerTypeName();
+                const enum_type = self.schema_def.getType(inner);
+                if (enum_type == null or !enum_type.?.isEnum()) {
+                    try self.result.addError("Enum value for non-enum argument", null, null);
+                    return;
+                }
+                if (enum_type.?.kind.enum_type.values.get(name) == null) {
+                    try self.result.addError("Enum value not found", null, null);
+                }
+            },
+            .list_value => |list| {
+                const unwrapped = if (expected_type.kind == .non_null) expected_type.kind.non_null.* else expected_type;
+                if (unwrapped.kind != .list) {
+                    try self.result.addError("List value for non-list argument", null, null);
+                    return;
+                }
+                const inner = unwrapped.kind.list.*;
+                for (list.items) |item| {
+                    try self.validateArgumentValue(item, inner);
+                }
+            },
+            .object_value => |obj| {
+                const inner = expected_type.innerTypeName();
+                const input_type = self.schema_def.getType(inner);
+                if (input_type == null or !input_type.?.isInputObject()) {
+                    try self.result.addError("Object value for non-input-object argument", null, null);
+                    return;
+                }
+                var iter = obj.iterator();
+                while (iter.next()) |entry| {
+                    const field_name = entry.key_ptr.*;
+                    const field_value = entry.value_ptr.*;
+                    const input_field = input_type.?.kind.input_object.fields.get(field_name);
+                    if (input_field == null) {
+                        try self.result.addError("Unknown input object field", null, null);
+                        continue;
+                    }
+                    try self.validateArgumentValue(field_value, input_field.?.value_type);
+                }
+            },
+        }
+    }
+
+    fn convertTypeRef(self: *Validator, t: *ast.Type) std.mem.Allocator.Error!ast.Type {
+        _ = self;
+        // For validation purposes, we keep ast.Type.
+        // This is a shallow copy since ast.Type contains pointers.
+        return t.*;
+    }
+};
+
+test "validator basic" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const user_field = schema.Field.init(allocator, "user", schema.TypeRef.named("User"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "user"), user_field);
+
+    var user_type = try allocator.create(schema.Type);
+    user_type.* = .{
+        .name = "User",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const name_field = schema.Field.init(allocator, "name", schema.TypeRef.named("String"));
+    try user_type.kind.object.fields.put(try allocator.dupe(u8, "name"), name_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("User", user_type);
+
+    const source = "query { user { name } }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(result.isValid());
+}
+
+test "validator invalid field" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { nonexistent }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator argument type mismatch" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    const arg = schema.InputValue{ .name = "greeting", .value_type = schema.TypeRef.named("String") };
+    try hello_field.arguments.put(try allocator.dupe(u8, "greeting"), arg);
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    // Pass int where string expected
+    const source = "query { hello(greeting: 123) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator enum argument" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var status_field = schema.Field.init(allocator, "status", schema.TypeRef.named("Status"));
+    const arg = schema.InputValue{ .name = "filter", .value_type = schema.TypeRef.named("Status") };
+    try status_field.arguments.put(try allocator.dupe(u8, "filter"), arg);
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "status"), status_field);
+
+    var status_enum = try allocator.create(schema.Type);
+    status_enum.* = .{
+        .name = "Status",
+        .kind = .{ .enum_type = schema.EnumType.init(allocator) },
+    };
+    try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "ACTIVE"), .{ .name = "ACTIVE" });
+    try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "INACTIVE"), .{ .name = "INACTIVE" });
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Status", status_enum);
+
+    // Valid enum value
+    const source = "query { status(filter: ACTIVE) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(result.isValid());
+}
+
+test "validator invalid enum argument" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var status_field = schema.Field.init(allocator, "status", schema.TypeRef.named("Status"));
+    const arg = schema.InputValue{ .name = "filter", .value_type = schema.TypeRef.named("Status") };
+    try status_field.arguments.put(try allocator.dupe(u8, "filter"), arg);
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "status"), status_field);
+
+    var status_enum = try allocator.create(schema.Type);
+    status_enum.* = .{
+        .name = "Status",
+        .kind = .{ .enum_type = schema.EnumType.init(allocator) },
+    };
+    try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "ACTIVE"), .{ .name = "ACTIVE" });
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Status", status_enum);
+
+    // Invalid enum value
+    const source = "query { status(filter: UNKNOWN) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator fragment cycle detection" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    // Direct cycle: A -> A
+    const source1 = "query { ...A } fragment A on Query { ...A hello }";
+    var parser1 = try @import("parser.zig").Parser.init(allocator, source1);
+    defer parser1.deinit();
+    var doc1 = try parser1.parseDocument();
+    defer doc1.deinit();
+
+    var validator1 = Validator.init(allocator, &schema_def);
+    defer validator1.deinit();
+    const result1 = try validator1.validate(&doc1);
+    try std.testing.expect(!result1.isValid());
+
+    // Indirect cycle: A -> B -> A
+    const source2 = "query { ...A } fragment A on Query { ...B } fragment B on Query { ...A }";
+    var parser2 = try @import("parser.zig").Parser.init(allocator, source2);
+    defer parser2.deinit();
+    var doc2 = try parser2.parseDocument();
+    defer doc2.deinit();
+
+    var validator2 = Validator.init(allocator, &schema_def);
+    defer validator2.deinit();
+    const result2 = try validator2.validate(&doc2);
+    try std.testing.expect(!result2.isValid());
+
+    // No cycle: A -> B (leaf)
+    const source3 = "query { ...A } fragment A on Query { ...B } fragment B on Query { hello }";
+    var parser3 = try @import("parser.zig").Parser.init(allocator, source3);
+    defer parser3.deinit();
+    var doc3 = try parser3.parseDocument();
+    defer doc3.deinit();
+
+    var validator3 = Validator.init(allocator, &schema_def);
+    defer validator3.deinit();
+    const result3 = try validator3.validate(&doc3);
+    try std.testing.expect(result3.isValid());
+}
+
+
+test "validator undefined variable" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    hello_field.arguments = std.StringHashMap(schema.InputValue).init(allocator);
+    try hello_field.arguments.put(try allocator.dupe(u8, "name"), .{ .name = "name", .value_type = schema.TypeRef.named("String") });
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello(name: $undefinedVar) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(result.errors.items.len > 0);
+}
+
+test "validator directive missing if argument" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello @skip }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(result.errors.items.len > 0);
+}
+
+test "validator directive invalid if type" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello @include(if: \"yes\") }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    try std.testing.expect(result.errors.items.len > 0);
+}
+
+test "validator valid directive" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello @skip(if: true) @include(if: false) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(result.isValid());
+}
+
+test "validator unknown directive" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello @unknown }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    var found = false;
+    for (result.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "Unknown directive") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "validator directive wrong location" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    // @skip is only valid on FIELD, FRAGMENT_SPREAD, INLINE_FRAGMENT — not on query operation
+    const source = "query @skip(if: true) { hello }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    var found = false;
+    for (result.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "Directive not valid in this location") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "validator directive not repeatable" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const source = "query { hello @skip(if: true) @skip(if: false) }";
+    var parser = try @import("parser.zig").Parser.init(allocator, source);
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+    var found = false;
+    for (result.errors.items) |err| {
+        if (std.mem.indexOf(u8, err.message, "Directive is not repeatable") != null) found = true;
+    }
+    try std.testing.expect(found);
+}

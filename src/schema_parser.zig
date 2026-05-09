@@ -1,0 +1,514 @@
+const std = @import("std");
+const Lexer = @import("lexer.zig").Lexer;
+const Token = @import("lexer.zig").Token;
+const schema = @import("schema.zig");
+
+pub const SchemaParseError = error{
+    UnexpectedToken,
+    MissingQueryType,
+    UnexpectedCharacter,
+    UnterminatedString,
+    InvalidEscape,
+    InvalidCharacterInString,
+    InvalidNumber,
+} || std.mem.Allocator.Error;
+
+/// Parses GraphQL Schema Definition Language (SDL) into a schema.Schema.
+///
+/// Supported:
+///   schema { query: TypeName, mutation: TypeName, subscription: TypeName }
+///   type TypeName implements Interface1, Interface2 { fields }
+///   interface TypeName { fields }
+///   enum TypeName { VALUE1, VALUE2 }
+///   union TypeName = Type1 | Type2
+///   input TypeName { fields }
+///   scalar TypeName
+///
+pub const SchemaParser = struct {
+    allocator: std.mem.Allocator,
+    lexer: Lexer,
+    current: Token,
+
+    pub fn init(allocator: std.mem.Allocator, source: []const u8) !SchemaParser {
+        var lexer = Lexer.init(allocator, source);
+        const current = try lexer.nextToken();
+        return .{
+            .allocator = allocator,
+            .lexer = lexer,
+            .current = current,
+        };
+    }
+
+    pub fn deinit(self: *SchemaParser) void {
+        self.freeToken(&self.current);
+    }
+
+    fn freeToken(self: *SchemaParser, token: *Token) void {
+        if (token.kind == .string or token.kind == .block_string) {
+            self.allocator.free(token.text);
+        }
+    }
+
+    pub fn parseSchema(self: *SchemaParser) SchemaParseError!schema.Schema {
+        var types = std.StringHashMap(*schema.Type).init(self.allocator);
+        defer types.deinit();
+
+        var query_type_name: ?[]const u8 = null;
+        var mutation_type_name: ?[]const u8 = null;
+        var subscription_type_name: ?[]const u8 = null;
+
+        while (self.current.kind != .eof) {
+            if (self.current.isKeyword("schema")) {
+                try self.parseSchemaDefinition(&query_type_name, &mutation_type_name, &subscription_type_name);
+            } else if (self.current.isKeyword("type")) {
+                const typ = try self.parseObjectType();
+                try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("interface")) {
+                const typ = try self.parseInterfaceType();
+                try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("enum")) {
+                const typ = try self.parseEnumType();
+                try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("union")) {
+                const typ = try self.parseUnionType();
+                try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("input")) {
+                const typ = try self.parseInputType();
+                try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("scalar")) {
+                const typ = try self.parseScalarType();
+                try types.put(typ.name, typ);
+            } else {
+                return error.UnexpectedToken;
+            }
+        }
+
+        // Resolve root types
+        const qt = types.get(query_type_name orelse return error.MissingQueryType) orelse return error.MissingQueryType;
+        var schema_def = schema.Schema.init(self.allocator, qt);
+
+        var iter = types.iterator();
+        while (iter.next()) |entry| {
+            try schema_def.registerType(entry.key_ptr.*, entry.value_ptr.*);
+        }
+
+        if (mutation_type_name) |name| {
+            if (types.get(name)) |mt| schema_def.mutation_type = mt;
+        }
+        if (subscription_type_name) |name| {
+            if (types.get(name)) |st| schema_def.subscription_type = st;
+        }
+
+        return schema_def;
+    }
+
+    // --- Token helpers ---
+
+    fn advance(self: *SchemaParser) SchemaParseError!void {
+        self.freeToken(&self.current);
+        self.current = try self.lexer.nextToken();
+    }
+
+    fn check(self: *SchemaParser, kind: Token.Kind) bool {
+        return self.current.kind == kind;
+    }
+
+    fn expect(self: *SchemaParser, kind: Token.Kind) SchemaParseError!void {
+        if (!self.check(kind)) return error.UnexpectedToken;
+        try self.advance();
+    }
+
+    fn expectName(self: *SchemaParser) SchemaParseError![]const u8 {
+        if (self.current.kind != .name) return error.UnexpectedToken;
+        const text = self.current.text;
+        try self.advance();
+        return text;
+    }
+
+    fn expectKeyword(self: *SchemaParser, kw: []const u8) SchemaParseError!void {
+        if (!self.current.isKeyword(kw)) return error.UnexpectedToken;
+        try self.advance();
+    }
+
+    // --- Definition parsers ---
+
+    fn parseSchemaDefinition(
+        self: *SchemaParser,
+        query_name: *?[]const u8,
+        mutation_name: *?[]const u8,
+        subscription_name: *?[]const u8,
+    ) SchemaParseError!void {
+        try self.expectKeyword("schema");
+        try self.expect(.lbrace);
+        while (!self.check(.rbrace)) {
+            const field_name = try self.expectName();
+            try self.expect(.colon);
+            const type_name = try self.expectName();
+            if (std.mem.eql(u8, field_name, "query")) {
+                query_name.* = type_name;
+            } else if (std.mem.eql(u8, field_name, "mutation")) {
+                mutation_name.* = type_name;
+            } else if (std.mem.eql(u8, field_name, "subscription")) {
+                subscription_name.* = type_name;
+            }
+            if (self.check(.rbrace)) break;
+        }
+        try self.expect(.rbrace);
+    }
+
+    fn parseObjectType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("type");
+        const name = try self.expectName();
+
+        var interfaces = std.array_list.Managed([]const u8).init(self.allocator);
+        errdefer interfaces.deinit();
+
+        if (self.current.isKeyword("implements")) {
+            try self.advance();
+            while (true) {
+                const iface = try self.expectName();
+                try interfaces.append(iface);
+                if (self.check(.amp)) {
+                    try self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        try self.expect(.lbrace);
+        var obj_type = schema.ObjectType.init(self.allocator);
+        errdefer obj_type.deinit(self.allocator);
+
+        while (!self.check(.rbrace)) {
+            const field = try self.parseFieldDefinition();
+            // Dup the name for the HashMap key; Field.name points to source text
+            try obj_type.fields.put(try self.allocator.dupe(u8, field.name), field);
+        }
+        try self.expect(.rbrace);
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .object = obj_type },
+        };
+        typ.kind.object.interfaces = interfaces;
+        return typ;
+    }
+
+    fn parseInterfaceType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("interface");
+        const name = try self.expectName();
+
+        try self.expect(.lbrace);
+        var iface_type = schema.InterfaceType.init(self.allocator);
+        errdefer iface_type.deinit(self.allocator);
+
+        while (!self.check(.rbrace)) {
+            const field = try self.parseFieldDefinition();
+            try iface_type.fields.put(try self.allocator.dupe(u8, field.name), field);
+        }
+        try self.expect(.rbrace);
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .interface = iface_type },
+        };
+        return typ;
+    }
+
+    fn parseEnumType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("enum");
+        const name = try self.expectName();
+
+        try self.expect(.lbrace);
+        var enum_type = schema.EnumType.init(self.allocator);
+        errdefer enum_type.deinit(self.allocator);
+
+        while (!self.check(.rbrace)) {
+            const val_name = try self.allocator.dupe(u8, try self.expectName());
+            try enum_type.values.put(val_name, .{ .name = val_name });
+            if (self.check(.rbrace)) break;
+        }
+        try self.expect(.rbrace);
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .enum_type = enum_type },
+        };
+        return typ;
+    }
+
+    fn parseUnionType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("union");
+        const name = try self.expectName();
+
+        try self.expect(.equals);
+        var union_type = schema.UnionType.init(self.allocator);
+        errdefer union_type.deinit(self.allocator);
+
+        while (true) {
+            const member = try self.expectName();
+            try union_type.possible_types.append(member);
+            if (self.check(.pipe)) {
+                try self.advance();
+            } else {
+                break;
+            }
+        }
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .union_type = union_type },
+        };
+        return typ;
+    }
+
+    fn parseInputType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("input");
+        const name = try self.expectName();
+
+        try self.expect(.lbrace);
+        var input_type = schema.InputObjectType.init(self.allocator);
+        errdefer input_type.deinit(self.allocator);
+
+        while (!self.check(.rbrace)) {
+            const field_name = try self.expectName();
+            try self.expect(.colon);
+            const field_type = try self.parseTypeRef();
+            const input_val = schema.InputValue{
+                .name = field_name,
+                .value_type = field_type,
+            };
+            try input_type.fields.put(try self.allocator.dupe(u8, field_name), input_val);
+            if (self.check(.rbrace)) break;
+        }
+        try self.expect(.rbrace);
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .input_object = input_type },
+        };
+        return typ;
+    }
+
+    fn parseScalarType(self: *SchemaParser) SchemaParseError!*schema.Type {
+        try self.expectKeyword("scalar");
+        const name = try self.expectName();
+
+        const typ = try self.allocator.create(schema.Type);
+        typ.* = .{
+            .name = name,
+            .kind = .{ .scalar = .{} },
+        };
+        return typ;
+    }
+
+    fn parseFieldDefinition(self: *SchemaParser) SchemaParseError!schema.Field {
+        const name = try self.expectName();
+
+        var field = schema.Field.init(self.allocator, name, schema.TypeRef.named(""));
+        errdefer field.deinit(self.allocator);
+
+        // Arguments
+        if (self.check(.lparen)) {
+            try self.advance();
+            while (!self.check(.rparen)) {
+                const arg_name = try self.expectName();
+                try self.expect(.colon);
+                const arg_type = try self.parseTypeRef();
+                const input_val = schema.InputValue{
+                    .name = arg_name,
+                    .value_type = arg_type,
+                };
+                try field.arguments.put(try self.allocator.dupe(u8, arg_name), input_val);
+                if (self.check(.rparen)) break;
+            }
+            try self.expect(.rparen);
+        }
+
+        try self.expect(.colon);
+        field.field_type = try self.parseTypeRef();
+
+        return field;
+    }
+
+    fn parseTypeRef(self: *SchemaParser) SchemaParseError!schema.TypeRef {
+        var result: schema.TypeRef = undefined;
+
+        if (self.check(.lbracket)) {
+            try self.advance();
+            const inner = try self.parseTypeRef();
+            try self.expect(.rbracket);
+            const inner_ptr = try self.allocator.create(schema.TypeRef);
+            inner_ptr.* = inner;
+            result = schema.TypeRef.list(inner_ptr);
+        } else {
+            const name = try self.expectName();
+            result = schema.TypeRef.named(name);
+        }
+
+        if (self.check(.bang)) {
+            try self.advance();
+            const result_ptr = try self.allocator.create(schema.TypeRef);
+            result_ptr.* = result;
+            return schema.TypeRef.nonNull(result_ptr);
+        }
+
+        return result;
+    }
+};
+
+test "schema parser basic" {
+    const allocator = std.testing.allocator;
+
+    const sdl =
+        \\schema {
+        \\  query: Query
+        \\}
+        \\
+        \\type Query {
+        \\  hello(name: String!): String!
+        \\  user(id: ID!): User
+        \\}
+        \\
+        \\type User {
+        \\  id: ID!
+        \\  name: String!
+        \\  email: String
+        \\}
+    ;
+
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var schema_def = try parser.parseSchema();
+    defer schema_def.deinit();
+
+    try std.testing.expectEqualStrings("Query", schema_def.query_type.name);
+    try std.testing.expect(schema_def.getType("User") != null);
+
+    const query_type = schema_def.query_type;
+    try std.testing.expect(query_type.kind.object.fields.contains("hello"));
+    try std.testing.expect(query_type.kind.object.fields.contains("user"));
+
+    const hello_field = query_type.kind.object.fields.get("hello").?;
+    try std.testing.expectEqualStrings("hello", hello_field.name);
+    try std.testing.expect(hello_field.arguments.contains("name"));
+}
+
+test "schema parser enum and union" {
+    const allocator = std.testing.allocator;
+
+    const sdl =
+        \\schema {
+        \\  query: Query
+        \\}
+        \\
+        \\type Query {
+        \\  status: Status
+        \\  search: SearchResult
+        \\}
+        \\
+        \\enum Status {
+        \\  ACTIVE
+        \\  INACTIVE
+        \\}
+        \\
+        \\union SearchResult = User
+        \\
+        \\type User {
+        \\  id: ID!
+        \\}
+    ;
+
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var schema_def = try parser.parseSchema();
+    defer schema_def.deinit();
+
+    const status_type = schema_def.getType("Status").?;
+    try std.testing.expect(status_type.isEnum());
+    try std.testing.expect(status_type.kind.enum_type.values.contains("ACTIVE"));
+
+    const search_result = schema_def.getType("SearchResult").?;
+    try std.testing.expect(search_result.isUnion());
+}
+
+test "schema parser interface and input" {
+    const allocator = std.testing.allocator;
+
+    const sdl =
+        \\schema {
+        \\  query: Query
+        \\}
+        \\
+        \\type Query {
+        \\  node(id: ID!): Node
+        \\}
+        \\
+        \\interface Node {
+        \\  id: ID!
+        \\}
+        \\
+        \\type User implements Node {
+        \\  id: ID!
+        \\  name: String!
+        \\}
+        \\
+        \\input CreateUserInput {
+        \\  name: String!
+        \\  email: String
+        \\}
+    ;
+
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var schema_def = try parser.parseSchema();
+    defer schema_def.deinit();
+
+    const node_type = schema_def.getType("Node").?;
+    try std.testing.expect(node_type.isInterface());
+    try std.testing.expect(node_type.kind.interface.fields.contains("id"));
+
+    const user_type = schema_def.getType("User").?;
+    try std.testing.expect(user_type.isObject());
+    try std.testing.expect(user_type.kind.object.interfaces.items.len > 0);
+
+    const input_type = schema_def.getType("CreateUserInput").?;
+    try std.testing.expect(input_type.isInputObject());
+    try std.testing.expect(input_type.kind.input_object.fields.contains("name"));
+}
+
+test "schema parser list and non-null" {
+    const allocator = std.testing.allocator;
+
+    const sdl =
+        \\schema {
+        \\  query: Query
+        \\}
+        \\
+        \\type Query {
+        \\  users: [User!]!
+        \\}
+        \\
+        \\type User {
+        \\  id: ID!
+        \\}
+    ;
+
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var schema_def = try parser.parseSchema();
+    defer schema_def.deinit();
+
+    const query_type = schema_def.query_type;
+    const users_field = query_type.kind.object.fields.get("users").?;
+    // [User!]! => non_null(list(non_null(User)))
+    try std.testing.expect(users_field.field_type.isNonNull());
+    try std.testing.expect(users_field.field_type.kind.non_null.*.isList());
+    try std.testing.expect(users_field.field_type.kind.non_null.*.kind.list.*.isNonNull());
+}
