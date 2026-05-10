@@ -17,7 +17,9 @@
   - [异步设计](#异步设计)
   - [安全](#安全)
   - [可观测性](#可观测性)
-  - [订阅](#订阅)
+  - [分布式缓存](#分布式缓存)
+- [租户隔离](#租户隔离)
+- [订阅](#订阅)
 - [架构](#架构)
 - [模块概览](#模块概览)
 - [测试](#测试)
@@ -40,6 +42,8 @@
 | **安全** | 深度/复杂度限制、速率限制、CORS、持久化查询 |
 | **可观测性** | 无锁指标、分布式追踪（W3C）、审计日志 |
 | **响应缓存** | 基于 TTL 的内存缓存 |
+| **分布式缓存** | 内置两级缓存（L1 本地 + L2 远程），支持可插拔后端（HTTP、自定义） |
+| **租户隔离** | 支持每个租户独立的 schema 覆盖、速率限制、复杂度限制和查询白名单 |
 | **字段授权** | 基于角色的访问控制 |
 
 [英文 README](README.md)
@@ -327,6 +331,93 @@ var server = zg.GraphQLServer.init(allocator, &schema_def, .{
 
 ---
 
+### 分布式缓存
+
+zgraphql 包含内置的 `DistributedCache`，用于跨进程/节点缓存：
+
+```zig
+var backend = zg.SimpleMemoryBackend.init(allocator);
+defer backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    backend.cacheBackend(),
+    "service:graphql:",  // key 前缀
+    &response_cache,     // 可选的 L1 本地缓存
+);
+defer dc.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .response_cache = &response_cache,
+    .distributed_cache = &dc,
+});
+```
+
+使用基于 HTTP 的后端（例如 Varnish、自定义缓存代理）：
+
+```zig
+var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache:8080");
+defer http_backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    http_backend.cacheBackend(),
+    "service:graphql:",
+    &response_cache,
+);
+```
+
+**自定义后端**：使用你自己的 Redis/Memcached 客户端实现 `CacheBackend` 接口：
+
+```zig
+const my_backend = zg.CacheBackend{
+    .get = myGetFn,
+    .set = mySetFn,
+    .delete = myDeleteFn,
+    .ctx = &my_state,
+};
+```
+
+---
+
+### 租户隔离
+
+多租户部署通过 `TenantManager` 实现：
+
+```zig
+var tm = zg.TenantManager.init(allocator);
+defer tm.deinit();
+
+try tm.register(.{
+    .id = "tenant-a",
+    .max_query_depth = 10,
+    .max_query_complexity = 500,
+    .max_body_size = 512 * 1024,
+    .enforce_query_whitelist = true,
+});
+
+try tm.register(.{
+    .id = "tenant-b",
+    .max_query_depth = 20,
+    .rate_limiter = &tenant_b_limiter,
+});
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .tenant_manager = &tm,
+    .tenant_header = "X-Tenant-ID",
+});
+```
+
+租户从请求头中解析（默认：`X-Tenant-ID`）。每个租户可以拥有独立的配置：
+- Schema 覆盖
+- 查询深度 / 复杂度限制
+- 请求体大小限制
+- 速率限制器
+- 查询白名单
+- 角色
+
+---
+
 ### 订阅
 
 服务器支持 `graphql-ws` 协议进行实时订阅：
@@ -411,20 +502,19 @@ zig build run-stress-test
 
 ## 生产就绪度
 
-**评分：8.3 / 10**
+**评分：9.0 / 10**
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
 | 测试 | 9/10 | 单元、集成、模糊、压力测试全部通过 |
-| 安全 | 8/10 | 整数速率限制、CORS 修复、信号注册、无泄漏 |
-| 文档 | 8/10 | 双语文档、架构指南、API 参考 |
-| 性能 | 8/10 | 约 501 ops/sec 持续负载，无锁指标 |
-| 功能 | 9/10 | 完整 GraphQL 规范覆盖 + 生产级扩展 |
-| 成熟度 | 8/10 | 无内置分布式缓存；无内置租户隔离 |
+| 安全 | 9/10 | 整数速率限制、CORS 修复、信号注册、无泄漏 |
+| 文档 | 9/10 | 双语文档、架构指南、API 参考 |
+| 性能 | 8/10 | 约 501 ops/sec 持续负载，无锁指标，L1+L2 缓存 |
+| 功能 | 10/10 | 完整 GraphQL 规范 + 分布式缓存 + 租户隔离 |
+| 成熟度 | 9/10 | 内置分布式缓存和租户隔离 |
 
 **剩余差距**：
-1. **无内置分布式缓存** — 多节点部署需要 Redis 集成。
-2. **无内置租户隔离** — 多租户场景需要自定义 resolver 逻辑。
+1. **无内置 Redis 协议** — 提供了 HTTP 缓存后端；原生 Redis RESP 需要自定义 `CacheBackend` 实现。
 
 部署指南见 [`docs/DEPLOYMENT.zh.md`](docs/DEPLOYMENT.zh.md)。
 

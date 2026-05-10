@@ -91,6 +91,12 @@ pub const ServerOptions = struct {
     /// When set, the server creates a root span per request and propagates
     /// the traceparent via response headers.
     tracer: ?*zg.Tracer = null,
+    /// Optional tenant manager for multi-tenant isolation.
+    tenant_manager: ?*zg.TenantManager = null,
+    /// Optional distributed cache (L2) for cross-process/node caching.
+    /// When set, the server checks this cache before the local response_cache
+    /// and stores successful responses here as well.
+    distributed_cache: ?*zg.DistributedCache = null,
 };
 
 pub const GraphQLServer = struct {
@@ -407,8 +413,27 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         return;
     }
 
+    // Tenant resolution
+    var resolved_tenant: ?*zg.Tenant = null;
+    if (self.options.tenant_manager) |tm| {
+        resolved_tenant = tm.resolve(request.head_buffer);
+    }
+
     // Rate limiting (applied to GraphQL endpoints only)
-    if (self.options.rate_limiter) |limiter| {
+    // Tenant-specific rate limiter takes precedence over global.
+    const effective_rate_limiter = if (resolved_tenant) |t| t.rate_limiter else null;
+    if (effective_rate_limiter) |limiter| {
+        if (client_addr) |addr| {
+            const now_ts = Io.Clock.Timestamp.now(io, .awake);
+            const elapsed = now_ts.raw.durationTo(Io.Timestamp.zero);
+            const now_ms: i64 = @intCast(@divFloor(elapsed.nanoseconds, std.time.ns_per_ms));
+            if (!limiter.allow(addr, now_ms)) {
+                try sendGraphQLErrorResponse(self.allocator, request, "Rate limit exceeded", .too_many_requests, origin);
+                had_error = false;
+                return;
+            }
+        }
+    } else if (self.options.rate_limiter) |limiter| {
         if (client_addr) |addr| {
             const now_ts = Io.Clock.Timestamp.now(io, .awake);
             const elapsed = now_ts.raw.durationTo(Io.Timestamp.zero);
@@ -437,11 +462,14 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         variables.deinit();
     }
 
+    // Determine effective body size limit (tenant overrides global)
+    const effective_max_body_size = if (resolved_tenant) |t| t.max_body_size orelse self.options.max_body_size else self.options.max_body_size;
+
     // Parse based on HTTP method
     if (head.method == .POST) {
         // Check body size
         const content_length = request.head.content_length orelse 0;
-        if (content_length > self.options.max_body_size) {
+        if (content_length > effective_max_body_size) {
             try sendGraphQLErrorResponse(self.allocator, request, "Request body too large", .payload_too_large, origin);
             return;
         }
@@ -563,7 +591,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         return;
     };
 
-    const result = executeGraphQLAndGetJson(self, io, query, operation_name, &variables) catch |err| {
+    const result = executeGraphQLAndGetJson(self, io, query, operation_name, &variables, resolved_tenant) catch |err| {
         log.err("execution pipeline error: {s}", .{@errorName(err)});
         try sendGraphQLErrorResponse(self.allocator, request, "Internal error", .internal_server_error, origin);
         return;
@@ -605,10 +633,18 @@ fn executeGraphQLAndGetJson(
     query: []const u8,
     operation_name: ?[]const u8,
     variables: *std.StringHashMap(Value),
+    tenant: ?*zg.Tenant,
 ) !struct { json_str: []const u8, complexity: u64, had_error: bool } {
+    // Determine effective configuration from tenant or global defaults
+    const effective_schema = if (tenant) |t| t.schema orelse self.schema_def else self.schema_def;
+    const effective_query_cache = if (tenant) |t| t.query_cache orelse self.options.query_cache else self.options.query_cache;
+    const effective_enforce_whitelist = if (tenant) |t| t.enforce_query_whitelist or self.options.enforce_query_whitelist else self.options.enforce_query_whitelist;
+    const effective_max_depth = if (tenant) |t| t.max_query_depth orelse self.options.max_query_depth else self.options.max_query_depth;
+    const effective_max_complexity = if (tenant) |t| t.max_query_complexity orelse self.options.max_query_complexity else self.options.max_query_complexity;
+
     // Query whitelist check
-    if (self.options.enforce_query_whitelist) {
-        if (self.options.query_cache) |cache| {
+    if (effective_enforce_whitelist) {
+        if (effective_query_cache) |cache| {
             if (!cache.contains(query)) {
                 return .{
                     .json_str = try buildErrorJson(self.allocator, "Query not in whitelist"),
@@ -628,6 +664,15 @@ fn executeGraphQLAndGetJson(
     // Response cache check (only for queries without runtime variables)
     const cacheable = variables.count() == 0;
     if (cacheable) {
+        // Check distributed cache (L2) first
+        if (self.options.distributed_cache) |dc| {
+            const now_ts = Io.Clock.Timestamp.now(io, .real);
+            const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
+            if (try dc.get(query, now_ms)) |cached| {
+                return .{ .json_str = cached, .complexity = 0, .had_error = false };
+            }
+        }
+        // Check local response cache (L1)
         if (self.options.response_cache) |cache| {
             const now_ts = Io.Clock.Timestamp.now(io, .real);
             const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
@@ -660,7 +705,7 @@ fn executeGraphQLAndGetJson(
     const complexity = @import("complexity.zig").ComplexityAnalyzer.analyzeDocument(&doc).complexity;
 
     // Check depth limit
-    if (self.options.max_query_depth) |max_depth| {
+    if (effective_max_depth) |max_depth| {
         const limit = @import("complexity.zig").DepthLimit{ .max_depth = max_depth };
         if (limit.check(&doc)) |actual_depth| {
             log.warn("query depth {d} exceeds limit {d}", .{ actual_depth, max_depth });
@@ -675,7 +720,7 @@ fn executeGraphQLAndGetJson(
     }
 
     // Check complexity limit
-    if (self.options.max_query_complexity) |max_complexity| {
+    if (effective_max_complexity) |max_complexity| {
         if (complexity > max_complexity) {
             log.warn("query complexity {d} exceeds limit {d}", .{ complexity, max_complexity });
             var buf: [256]u8 = undefined;
@@ -689,7 +734,7 @@ fn executeGraphQLAndGetJson(
     }
 
     // Validate
-    var validator = zg.Validator.init(self.allocator, self.schema_def);
+    var validator = zg.Validator.init(self.allocator, effective_schema);
     defer validator.deinit();
     const validation_result = validator.validate(&doc) catch |err| {
         log.err("validation error: {s}", .{@errorName(err)});
@@ -731,7 +776,7 @@ fn executeGraphQLAndGetJson(
     }
 
     // Execute
-    var executor = zg.Executor.init(self.allocator, self.schema_def, io);
+    var executor = zg.Executor.init(self.allocator, effective_schema, io);
     defer executor.deinit();
     if (self.options.hooks) |hooks| {
         executor.hooks = hooks;
@@ -759,9 +804,16 @@ fn executeGraphQLAndGetJson(
 
     // Store successful cacheable response
     if (cacheable) {
+        const now_ts = Io.Clock.Timestamp.now(io, .real);
+        const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
+        // Store to distributed cache (L2)
+        if (self.options.distributed_cache) |dc| {
+            dc.setWithDefaultTtl(query, json_str, now_ms) catch |err| {
+                log.warn("failed to store to distributed cache: {s}", .{@errorName(err)});
+            };
+        }
+        // Store to local response cache (L1)
         if (self.options.response_cache) |cache| {
-            const now_ts = Io.Clock.Timestamp.now(io, .real);
-            const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
             cache.put(query, json_str, now_ms) catch |err| {
                 log.warn("failed to cache response: {s}", .{@errorName(err)});
             };
@@ -1081,7 +1133,7 @@ fn executeBatch(
             continue;
         };
 
-        const batch_result = executeGraphQLAndGetJson(self, io, batch_query, batch_op_name, &batch_variables) catch |err| {
+        const batch_result = executeGraphQLAndGetJson(self, io, batch_query, batch_op_name, &batch_variables, null) catch |err| {
             log.err("batch execution pipeline error: {s}", .{@errorName(err)});
             const err_json = try buildErrorJson(self.allocator, "Internal error");
             try results.append(err_json);
@@ -1467,7 +1519,7 @@ fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket) !vo
             }
 
             // Non-subscription: single-shot execution
-            const result = executeGraphQLAndGetJson(self, io, query, operation_name, &variables) catch |err| {
+            const result = executeGraphQLAndGetJson(self, io, query, operation_name, &variables, null) catch |err| {
                 log.err("websocket execution error: {s}", .{@errorName(err)});
                 const err_json = try buildErrorJson(self.allocator, "Internal error");
                 defer self.allocator.free(err_json);
@@ -1539,7 +1591,7 @@ test "server executeGraphQLAndGetJson basic" {
         variables.deinit();
     }
 
-    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables);
+    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables, null);
     defer allocator.free(result.json_str);
     try std.testing.expect(!result.had_error);
     try std.testing.expect(std.mem.indexOf(u8, result.json_str, "world") != null);
@@ -1587,7 +1639,7 @@ test "server depth limit" {
         variables.deinit();
     }
 
-    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ user { name } }", null, &variables);
+    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ user { name } }", null, &variables, null);
     defer allocator.free(result.json_str);
     try std.testing.expect(result.had_error);
     try std.testing.expect(std.mem.indexOf(u8, result.json_str, "depth") != null);
@@ -1630,7 +1682,7 @@ test "server complexity limit" {
         variables.deinit();
     }
 
-    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ a b c }", null, &variables);
+    const result = try executeGraphQLAndGetJson(&server, backend.io(), "{ a b c }", null, &variables, null);
     defer allocator.free(result.json_str);
     try std.testing.expect(result.had_error);
     try std.testing.expect(std.mem.indexOf(u8, result.json_str, "complexity") != null);
@@ -1680,12 +1732,12 @@ test "server query whitelist" {
     }
 
     // Allowed query
-    const ok_result = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables);
+    const ok_result = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables, null);
     defer allocator.free(ok_result.json_str);
     try std.testing.expect(!ok_result.had_error);
 
     // Rejected query
-    const reject_result = try executeGraphQLAndGetJson(&server, backend.io(), "{ goodbye }", null, &variables);
+    const reject_result = try executeGraphQLAndGetJson(&server, backend.io(), "{ goodbye }", null, &variables, null);
     defer allocator.free(reject_result.json_str);
     try std.testing.expect(reject_result.had_error);
     try std.testing.expect(std.mem.indexOf(u8, reject_result.json_str, "whitelist") != null);

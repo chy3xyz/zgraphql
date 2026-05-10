@@ -152,10 +152,68 @@ zgraphql 不提供内置的租户隔离。多租户部署方案：
 - **方案 B**：单一实例，通过 `ExecutionContext.user_data` 在 resolver 级别进行租户过滤。
 - **方案 C**：按 schema 分片；通过路由层为每个请求加载不同的 `Schema` 对象。
 
-### 7. 水平扩展
+### 7. 分布式缓存（多节点）
+
+多节点部署时，使用 `DistributedCache` 配合 HTTP 缓存后端：
+
+```zig
+var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache-proxy:8080");
+defer http_backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    http_backend.cacheBackend(),
+    "zgraphql:",
+    &response_cache, // L1 本地缓存
+);
+defer dc.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .response_cache = &response_cache,
+    .distributed_cache = &dc,
+});
+```
+
+缓存代理可以是 Varnish、带缓存的 Nginx，或自定义的轻量级缓存服务。期望的 REST API：
+- `GET /{key}` -> 200 返回 body 或 404
+- `PUT /{key}?ttl={ms}` -> 存储 body 并设置 TTL
+- `DELETE /{key}` -> 删除条目
+
+如需使用 Redis，可通过 RESP 客户端实现 `CacheBackend` 接口。
+
+### 8. 租户隔离（多租户）
+
+注册具有独立限制的租户：
+
+```zig
+var tm = zg.TenantManager.init(allocator);
+defer tm.deinit();
+
+try tm.register(.{
+    .id = "tenant-a",
+    .max_query_depth = 10,
+    .max_query_complexity = 500,
+    .max_body_size = 512 * 1024,
+    .enforce_query_whitelist = true,
+});
+
+try tm.register(.{
+    .id = "tenant-b",
+    .max_query_depth = 20,
+    .rate_limiter = &tenant_b_limiter,
+});
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .tenant_manager = &tm,
+});
+```
+
+默认通过 `X-Tenant-ID` 请求头解析租户。每个请求受租户配置的限制约束。如果没有匹配的租户且未设置默认租户，则使用全局服务器选项。
+
+### 9. 水平扩展
 
 高流量场景下，在负载均衡器后运行多个 `zgraphql` 进程：
 
-- 使用 **Redis** 或 **Memcached** 作为共享 `ResponseCache`（需自定义实现）。
+- 使用 `DistributedCache` 配合 HTTP 缓存后端，在节点间共享查询结果。
 - 将 `QueryCache`（APQ 白名单）存储在共享 KV 存储中。
 - 无状态设计使扩展变得简单直接。

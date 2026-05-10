@@ -152,10 +152,68 @@ zgraphql does not provide built-in tenant isolation. For multi-tenant deployment
 - **Option B**: Use a single instance with resolver-level tenant filtering via `ExecutionContext.user_data`.
 - **Option C**: Shard by schema; load different `Schema` objects per request using a routing layer.
 
-### 7. Horizontal Scaling
+### 7. Distributed Cache (Multi-Node)
+
+For multi-node deployments, use `DistributedCache` with an HTTP cache backend:
+
+```zig
+var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache-proxy:8080");
+defer http_backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    http_backend.cacheBackend(),
+    "zgraphql:",
+    &response_cache, // L1 local cache
+);
+defer dc.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .response_cache = &response_cache,
+    .distributed_cache = &dc,
+});
+```
+
+The cache proxy can be Varnish, Nginx with cache, or a custom lightweight cache service. The expected REST API:
+- `GET /{key}` -> 200 with body or 404
+- `PUT /{key}?ttl={ms}` -> store body with TTL
+- `DELETE /{key}` -> remove entry
+
+For Redis, implement the `CacheBackend` interface using a RESP client.
+
+### 8. Tenant Isolation (Multi-Tenant)
+
+Register tenants with independent limits:
+
+```zig
+var tm = zg.TenantManager.init(allocator);
+defer tm.deinit();
+
+try tm.register(.{
+    .id = "tenant-a",
+    .max_query_depth = 10,
+    .max_query_complexity = 500,
+    .max_body_size = 512 * 1024,
+    .enforce_query_whitelist = true,
+});
+
+try tm.register(.{
+    .id = "tenant-b",
+    .max_query_depth = 20,
+    .rate_limiter = &tenant_b_limiter,
+});
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .tenant_manager = &tm,
+});
+```
+
+Tenants are resolved via the `X-Tenant-ID` header by default. Each request is subject to the tenant's configured limits. If no tenant matches and no default tenant is set, the global server options are used.
+
+### 9. Horizontal Scaling
 
 For high-traffic scenarios, run multiple `zgraphql` processes behind a load balancer:
 
-- Use **Redis** or **Memcached** for shared `ResponseCache` (custom implementation required).
+- Use `DistributedCache` with an HTTP cache backend for shared query results across nodes.
 - Store `QueryCache` (APQ whitelist) in a shared KV store.
 - Stateless design makes scaling straightforward.

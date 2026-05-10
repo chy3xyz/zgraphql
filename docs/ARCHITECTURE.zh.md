@@ -62,6 +62,8 @@ GraphQL 查询字符串 / SDL
 | `dataloader.zig` | 请求级批量加载和缓存，解决 N+1 问题。 |
 | `rate_limiter.zig` | 令牌桶速率限制器，使用整数运算保证生产稳定性。 |
 | `response_cache.zig` | 基于 TTL 的内存响应缓存，用于可缓存查询。 |
+| `distributed_cache.zig` | 两级缓存（L1 本地 + L2 远程），支持可插拔后端（HTTP、内存、自定义）。 |
+| `tenant.zig` | 多租户管理器，支持每个租户的 schema 覆盖、限制和查询白名单。 |
 | `audit_log.zig` | 结构化的 JSON Lines 审计日志，记录每个 GraphQL 请求。 |
 | `tracing.zig` | 兼容 W3C traceparent 的分布式追踪，支持 OpenTelemetry 风格的 span 导出。 |
 | `doc_generator.zig` | 从内省数据生成 Markdown API 文档。 |

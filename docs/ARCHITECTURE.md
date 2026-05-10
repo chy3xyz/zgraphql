@@ -62,6 +62,8 @@ Built for Zig 0.16.0's `std.Io` abstraction:
 | `dataloader.zig` | Request-level batch loading and caching to solve the N+1 problem. |
 | `rate_limiter.zig` | Token-bucket rate limiter using integer arithmetic for production stability. |
 | `response_cache.zig` | TTL-based in-memory response cache for cacheable queries. |
+| `distributed_cache.zig` | Two-tier cache (L1 local + L2 remote) with pluggable backends (HTTP, in-memory, custom). |
+| `tenant.zig` | Multi-tenant manager with per-tenant schema overrides, limits, and query whitelists. |
 | `audit_log.zig` | Structured JSON Lines audit logging of every GraphQL request. |
 | `tracing.zig` | W3C traceparent compatible distributed tracing with OpenTelemetry-style span export. |
 | `doc_generator.zig` | Generates Markdown API documentation from introspection data. |

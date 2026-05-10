@@ -187,6 +187,63 @@ const json = try tracer.exportJson(allocator);
 
 ---
 
+### DistributedCache
+```zig
+var backend = zg.SimpleMemoryBackend.init(allocator);
+defer backend.deinit();
+
+var dc = zg.DistributedCache.init(allocator, backend.cacheBackend(), "prefix:", &l1_cache);
+defer dc.deinit();
+
+const cached = try dc.get("{ hello }", now_ms);
+const json = try dc.get("{ hello }", now_ms);
+try dc.set("{ hello }", json_str, ttl_ms, now_ms);
+try dc.setWithDefaultTtl("{ hello }", json_str, now_ms);
+try dc.delete("{ hello }");
+```
+
+**HttpCacheBackend**
+```zig
+var http = try zg.HttpCacheBackend.init(allocator, "http://cache:8080");
+defer http.deinit();
+var dc = zg.DistributedCache.init(allocator, http.cacheBackend(), "prefix:", &l1);
+```
+
+**Custom Backend**
+```zig
+const my_backend = zg.CacheBackend{
+    .get = myGetFn,
+    .set = mySetFn,
+    .delete = myDeleteFn,
+    .ctx = &my_state,
+};
+```
+
+---
+
+### TenantManager
+```zig
+var tm = zg.TenantManager.init(allocator);
+defer tm.deinit();
+
+try tm.register(.{
+    .id = "tenant-a",
+    .max_query_depth = 10,
+    .max_query_complexity = 500,
+    .max_body_size = 512 * 1024,
+    .rate_limiter = &limiter,
+    .enforce_query_whitelist = true,
+    .roles = &.{"user"},
+});
+
+try tm.setDefault(.{ .id = "default", .max_query_depth = 20 });
+
+const tenant = tm.resolve(request_headers);
+const by_id = tm.resolveById("tenant-a");
+```
+
+---
+
 ## Error Types
 
 ```zig
