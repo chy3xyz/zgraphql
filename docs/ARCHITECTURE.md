@@ -1,8 +1,6 @@
-# Architecture 架构
+# Architecture
 
-> English below, 中文在后
-
-## Overview 概述
+## Overview
 
 `zgraphql` follows a classic compiler pipeline architecture, adapted for GraphQL query execution:
 
@@ -28,34 +26,23 @@ GraphQL Query String / SDL
    [JSON] --> Response
 ```
 
-## Design Principles 设计原则
+## Design Principles
 
-### Zero External Dependencies 零外部依赖
+### Zero External Dependencies
 All functionality is implemented using only the Zig standard library. This eliminates supply-chain attack vectors and ensures the library remains maintainable as Zig evolves.
 
-全部功能仅使用 Zig 标准库实现。这消除了供应链攻击面，并确保库能够随 Zig 的演进而保持可维护性。
-
-### Memory Safety 内存安全
+### Memory Safety
 - Every heap-allocated value has a corresponding `deinit()`.
 - `errdefer` is used extensively to prevent leaks on error paths.
 - Unit tests run under `std.testing.allocator` which detects leaks automatically.
 
-- 每个堆分配的值都有对应的 `deinit()`。
-- 大量使用 `errdefer` 防止错误路径上的内存泄漏。
-- 单元测试在 `std.testing.allocator` 下运行，可自动检测泄漏。
-
-### Concurrency Model 并发模型
+### Concurrency Model
 Built for Zig 0.16.0's `std.Io` abstraction:
 - **Linux**: io_uring backend for true async I/O.
 - **macOS/Windows/BSD**: Threaded backend using a work-stealing thread pool.
 - Resolvers are plain functions that run inside fibers managed by `std.Io`. No explicit `async/await` syntax is required.
 
-为 Zig 0.16.0 的 `std.Io` 抽象而构建：
-- **Linux**：io_uring 后端实现真正的异步 I/O。
-- **macOS/Windows/BSD**：基于工作窃取线程池的 Threaded 后端。
-- Resolver 是在 `std.Io` 管理的纤程中运行的普通函数，无需显式的 `async/await` 语法。
-
-## Module Responsibilities 模块职责
+## Module Responsibilities
 
 | Module | Responsibility |
 |--------|----------------|

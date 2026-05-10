@@ -1,31 +1,25 @@
-/// ============================================================================
-/// DataLoader Example / DataLoader 示例
+/// DataLoader Example
 /// ============================================================================
 /// This example demonstrates the N+1 problem solution using DataLoader.
 /// DataLoader batches and deduplicates multiple individual loads into a
 /// single batch function call, dramatically reducing database round-trips.
-///
-/// 本示例演示了使用 DataLoader 解决 N+1 问题。
-/// DataLoader 将多个独立的加载请求批量化和去重，合并为单次批量函数调用，
-/// 显著减少数据库往返次数。
 /// ============================================================================
 
 const std = @import("std");
 const zg = @import("zgraphql");
 
-/// Simulated database / 模拟数据库
+/// Simulated database
 const FakeDb = struct {
-    /// How many batch queries were executed / 执行了多少次批量查询
+    /// How many batch queries were executed
     query_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Batch fetch users by IDs / 按 ID 批量获取用户
+    /// Batch fetch users by IDs
     fn fetchUsers(db: *FakeDb, alloc: std.mem.Allocator, ids: []const []const u8) ![]zg.Value {
         _ = db.query_count.fetchAdd(1, .seq_cst);
 
         var results = try alloc.alloc(zg.Value, ids.len);
         for (ids, 0..) |id, i| {
             // In real code: SELECT * FROM users WHERE id IN (...)
-            // 真实代码：SELECT * FROM users WHERE id IN (...)
             var user = zg.Value.initObject(alloc);
             try user.data.object.put(try alloc.dupe(u8, "id"), zg.Value.fromString(alloc, try alloc.dupe(u8, id)));
             try user.data.object.put(try alloc.dupe(u8, "name"), zg.Value.fromString(alloc, try std.fmt.allocPrint(alloc, "User_{s}", .{id})));
@@ -42,7 +36,7 @@ pub fn main() !void {
 
     var db = FakeDb{};
 
-    // Create DataLoader with a batch function / 创建 DataLoader 并设置批量函数
+    // Create DataLoader with a batch function
     const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
     var backend = IoBackend.init(allocator, .{});
     defer backend.deinit();
@@ -60,10 +54,6 @@ pub fn main() !void {
     // Simulate resolving multiple user fields in a single GraphQL query.
     // Without DataLoader, this would trigger N separate DB queries.
     // With DataLoader, all loads are batched into a single DB call.
-    //
-    // 模拟在单个 GraphQL 查询中解析多个用户字段。
-    // 没有 DataLoader 时，这会触发 N 次独立的数据库查询。
-    // 使用 DataLoader，所有加载都被合并为一次数据库调用。
     const user_ids = &.{ "1", "2", "3", "4", "5" };
 
     std.debug.print("Loading {d} users...\n", .{user_ids.len});
@@ -77,11 +67,10 @@ pub fn main() !void {
     }
 
     // Load the same key again - it hits the cache, no DB call.
-    // 再次加载相同的 key - 命中缓存，无数据库调用。
     const cached = dl.load("1");
     std.debug.print("\nCache hit for '1': {s}\n", .{if (cached != null) "yes" else "no"});
 
-    // Second batch load / 第二次批量加载
+    // Second batch load
     const more_ids = &.{ "1", "3", "6" };
     std.debug.print("\nLoading {d} more users (some already cached)...\n", .{more_ids.len});
     const more = try dl.loadMany(more_ids);

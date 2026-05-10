@@ -1,6 +1,6 @@
-# API Quick Reference
+# API 速查手册
 
-## Core Types
+## 核心类型
 
 ### Value
 ```zig
@@ -21,23 +21,23 @@ pub const Value = struct {
 };
 ```
 
-**Constructors**
+**构造器**
 ```zig
 Value.fromNull(allocator)
 Value.fromInt(allocator, v: i64)
 Value.fromFloat(allocator, v: f64)
-Value.fromString(allocator, v: []const u8)    // takes ownership
+Value.fromString(allocator, v: []const u8)    // 获取所有权
 Value.fromBool(allocator, v: bool)
-Value.fromEnum(allocator, v: []const u8)      // takes ownership
+Value.fromEnum(allocator, v: []const u8)      // 获取所有权
 Value.initList(allocator)
 Value.initObject(allocator)
 ```
 
-**Lifecycle**
+**生命周期**
 ```zig
-value.deinit()      // Deep free
-value.clone()       // Deep copy
-value.toJson()      // Serialize to JSON string
+value.deinit()      // 深度释放
+value.clone()       // 深度拷贝
+value.toJson()      // 序列化为 JSON 字符串
 ```
 
 ---
@@ -70,7 +70,7 @@ var result = try executor.execute(&doc);
 defer result.deinit();
 ```
 
-**Execution Hooks**
+**执行钩子**
 ```zig
 pub const ExecutionHooks = struct {
     before_field_execute: ?*const fn (ctx: ?*anyopaque, field_name: []const u8) bool,
@@ -90,7 +90,7 @@ const Builder = comptime zg.SchemaBuilder(.{
     },
 });
 
-const sdl = Builder.sdl;              // comptime string
+const sdl = Builder.sdl;              // 编译期字符串
 var schema_def = try Builder.init(allocator);
 defer schema_def.deinit();
 ```
@@ -128,7 +128,7 @@ dl.setBatchLoader(struct {
     fn batch(ctx: ?*anyopaque, alloc: std.mem.Allocator, keys: []const []const u8) ![]zg.Value { ... }
 }.batch, null);
 
-// Load from cache or batch
+// 从缓存加载或批量加载
 const v = dl.load("key1");
 const vs = try dl.loadMany(&.{"1", "2", "3"});
 ```
@@ -155,8 +155,8 @@ defer allocator.free(json);
 ### RateLimiter
 ```zig
 var limiter = zg.RateLimiter.init(allocator, capacity, refill_rate);
-// capacity: max burst tokens
-// refill_rate: tokens per second
+// capacity: 最大突发令牌数
+// refill_rate: 每秒补充令牌数
 
 const allowed = limiter.allow("client_id", now_ms);
 ```
@@ -187,7 +187,7 @@ const json = try tracer.exportJson(allocator);
 
 ---
 
-## Error Types
+## 错误类型
 
 ```zig
 pub const ExecutionError = error{
@@ -205,8 +205,8 @@ pub const ExecutionError = error{
 } || std.mem.Allocator.Error;
 ```
 
-## Constants
+## 常量
 
-| Name | Default | Description |
-|------|---------|-------------|
-| `max_server_instances` | `16` | Max concurrent server instances for signal handling. |
+| 名称 | 默认值 | 说明 |
+|------|--------|------|
+| `max_server_instances` | `16` | 信号处理支持的最大并发服务器实例数 |

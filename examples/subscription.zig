@@ -1,11 +1,7 @@
-/// ============================================================================
-/// Subscription Example / 订阅示例
+/// Subscription Example
 /// ============================================================================
 /// This example demonstrates WebSocket-based subscriptions using the
 /// `graphql-ws` protocol. Subscriptions push real-time updates to clients.
-///
-/// 本示例演示了基于 WebSocket 的订阅，使用 `graphql-ws` 协议。
-/// 订阅将实时更新推送给客户端。
 /// ============================================================================
 
 const std = @import("std");
@@ -14,9 +10,6 @@ const zg = @import("zgraphql");
 /// Simulates a real-time data source (e.g., a message broker, event bus, or
 /// database change stream). In production, this could be a Kafka consumer or
 /// an in-memory channel.
-///
-/// 模拟实时数据源（例如消息代理、事件总线或数据库变更流）。
-/// 在生产环境中，这可以是一个 Kafka 消费者或内存通道。
 const EventBus = struct {
     var counter: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
 
@@ -30,7 +23,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Schema with a subscription root / 带有订阅根类型的 Schema
+    // Schema with a subscription root
     const Builder = comptime zg.SchemaBuilder(.{
         .Query = .{
             .hello = .{ .type = "String!" },
@@ -54,10 +47,6 @@ pub fn main() !void {
     // Subscription resolver: returns a stream of values.
     // In zgraphql, subscription resolvers are registered similarly to field
     // resolvers, but the executor treats them as streaming sources.
-    //
-    // 订阅 resolver：返回一个值的流。
-    // 在 zgraphql 中，订阅 resolver 的注册方式与普通字段 resolver 类似，
-    // 但执行器将其视为流式数据源。
     if (schema_def.subscription_type) |sub_type| {
         if (sub_type.kind.object.fields.getPtr("counter")) |field| {
             field.resolve = struct {
@@ -69,7 +58,7 @@ pub fn main() !void {
         }
     }
 
-    // Setup server / 设置服务器
+    // Setup server
     var server = zg.GraphQLServer.init(allocator, &schema_def, .{
         .bind_address = std.Io.net.IpAddress.parseIp4("127.0.0.1", 8080) catch unreachable,
         .max_query_depth = 15,
