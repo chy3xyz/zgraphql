@@ -196,6 +196,53 @@ pub const Value = struct {
         defer self.allocator.free(json_str);
         try writer.writeAll(json_str);
     }
+
+    /// Parse a JSON string into a GraphQL Value tree.
+    /// Caller owns the returned Value and must call deinit().
+    pub fn fromJson(allocator: std.mem.Allocator, json_str: []const u8) (std.mem.Allocator.Error || error{InvalidJson})!Value {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return error.InvalidJson;
+        defer parsed.deinit();
+        return try fromStdJson(allocator, parsed.value);
+    }
+
+    /// Convert std.json.Value to GraphQL Value recursively.
+    fn fromStdJson(allocator: std.mem.Allocator, json_val: std.json.Value) std.mem.Allocator.Error!Value {
+        switch (json_val) {
+            .null => return fromNull(allocator),
+            .bool => |b| return fromBool(allocator, b),
+            .integer => |i| return fromInt(allocator, i),
+            .float => |f| return fromFloat(allocator, f),
+            .number_string => |s| {
+                if (std.fmt.parseInt(i64, s, 10)) |i| {
+                    return fromInt(allocator, i);
+                } else |_| {
+                    if (std.fmt.parseFloat(f64, s)) |f| {
+                        return fromFloat(allocator, f);
+                    } else |_| {
+                        return fromString(allocator, try allocator.dupe(u8, s));
+                    }
+                }
+            },
+            .string => |s| return fromString(allocator, try allocator.dupe(u8, s)),
+            .array => |arr| {
+                var list = initList(allocator);
+                errdefer list.deinit();
+                for (arr.items) |item| {
+                    try list.data.list.append(try fromStdJson(allocator, item));
+                }
+                return list;
+            },
+            .object => |obj| {
+                var graph_obj = initObject(allocator);
+                errdefer graph_obj.deinit();
+                var iter = obj.iterator();
+                while (iter.next()) |entry| {
+                    try graph_obj.data.object.put(try allocator.dupe(u8, entry.key_ptr.*), try fromStdJson(allocator, entry.value_ptr.*));
+                }
+                return graph_obj;
+            },
+        }
+    }
 };
 
 fn writeJsonString(str: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -293,4 +340,56 @@ test "value clone" {
     try std.testing.expect(original.data.object.get("nested").?.data.list.items[0].data.string.ptr !=
         cloned.data.object.get("nested").?.data.list.items[0].data.string.ptr);
     try std.testing.expectEqualStrings("deep", cloned.data.object.get("nested").?.data.list.items[0].data.string);
+}
+
+test "value fromJson roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Primitives
+    var null_val = try Value.fromJson(allocator, "null");
+    defer null_val.deinit();
+    try std.testing.expect(null_val.data == .null);
+
+    var int_val = try Value.fromJson(allocator, "42");
+    defer int_val.deinit();
+    try std.testing.expectEqual(@as(i64, 42), int_val.data.int);
+
+    var float_val = try Value.fromJson(allocator, "3.14");
+    defer float_val.deinit();
+    try std.testing.expectEqual(@as(f64, 3.14), float_val.data.float);
+
+    var str_val = try Value.fromJson(allocator, "\"hello\"");
+    defer str_val.deinit();
+    try std.testing.expectEqualStrings("hello", str_val.data.string);
+
+    var bool_val = try Value.fromJson(allocator, "true");
+    defer bool_val.deinit();
+    try std.testing.expect(bool_val.data.boolean);
+
+    // Array
+    var arr_val = try Value.fromJson(allocator, "[1, 2, 3]");
+    defer arr_val.deinit();
+    try std.testing.expectEqual(@as(usize, 3), arr_val.data.list.items.len);
+    try std.testing.expectEqual(@as(i64, 1), arr_val.data.list.items[0].data.int);
+
+    // Object
+    var obj_val = try Value.fromJson(allocator, "{\"name\":\"Alice\",\"age\":30}");
+    defer obj_val.deinit();
+    try std.testing.expectEqualStrings("Alice", obj_val.data.object.get("name").?.data.string);
+    try std.testing.expectEqual(@as(i64, 30), obj_val.data.object.get("age").?.data.int);
+
+    // Roundtrip: Value → JSON → Value → JSON
+    var original = Value.initObject(allocator);
+    try original.data.object.put(try allocator.dupe(u8, "x"), Value.fromInt(allocator, 1));
+    const json = try original.toJson();
+    defer allocator.free(json);
+    var roundtripped = try Value.fromJson(allocator, json);
+    defer roundtripped.deinit();
+    defer original.deinit();
+    try std.testing.expectEqual(@as(i64, 1), roundtripped.data.object.get("x").?.data.int);
+}
+
+test "value fromJson invalid" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidJson, Value.fromJson(allocator, "not json"));
 }

@@ -20,13 +20,17 @@ pub const RateLimiter = struct {
 
     /// Create a rate limiter. `capacity` and `refill_rate` are in whole tokens per second.
     /// Internally they are scaled to milli-tokens for precision.
+    /// Values are clamped to avoid i64 overflow.
     pub fn init(allocator: std.mem.Allocator, capacity: u64, refill_rate: u64) RateLimiter {
+        const max_safe: u64 = @intCast(@divFloor(std.math.maxInt(i64), 1000));
+        const cap = if (capacity > max_safe) std.math.maxInt(i64) else @as(i64, @intCast(capacity)) * 1000;
+        const rate = if (refill_rate > max_safe) std.math.maxInt(i64) else @as(i64, @intCast(refill_rate)) * 1000;
         return .{
             .allocator = allocator,
             .buckets = std.StringHashMap(Bucket).init(allocator),
             .mutex = .unlocked,
-            .capacity = @as(i64, @intCast(capacity)) * 1000,
-            .refill_rate = @as(i64, @intCast(refill_rate)) * 1000,
+            .capacity = cap,
+            .refill_rate = rate,
         };
     }
 
@@ -56,7 +60,8 @@ pub const RateLimiter = struct {
             return true;
         }
 
-        const elapsed_ms = now_ms - gop.value_ptr.last_update_ms;
+        // Clamp elapsed time to handle clock regression
+        const elapsed_ms = if (now_ms > gop.value_ptr.last_update_ms) now_ms - gop.value_ptr.last_update_ms else 0;
         // Refill = (elapsed_ms * refill_rate) / 1000 milliseconds
         const refill = @divFloor(elapsed_ms * self.refill_rate, 1000);
         gop.value_ptr.tokens = @min(self.capacity, gop.value_ptr.tokens + refill);
@@ -67,6 +72,41 @@ pub const RateLimiter = struct {
             return true;
         }
         return false;
+    }
+
+    /// Remove a specific key from the rate limiter.
+    pub fn remove(self: *RateLimiter, key: []const u8) void {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.buckets.fetchRemove(key)) |removed| {
+            self.allocator.free(removed.key);
+        }
+    }
+
+    /// Remove entries that haven't been accessed since `older_than_ms`.
+    /// Call periodically to prevent unbounded memory growth.
+    pub fn prune(self: *RateLimiter, older_than_ms: i64) void {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
+        var to_remove = std.array_list.Managed([]const u8).init(self.allocator);
+        defer {
+            for (to_remove.items) |k| self.allocator.free(k);
+            to_remove.deinit();
+        }
+
+        var iter = self.buckets.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.last_update_ms < older_than_ms) {
+                to_remove.append(self.allocator.dupe(u8, entry.key_ptr.*)) catch continue;
+            }
+        }
+
+        for (to_remove.items) |k| {
+            if (self.buckets.fetchRemove(k)) |removed| {
+                self.allocator.free(removed.key);
+            }
+        }
     }
 };
 

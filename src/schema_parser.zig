@@ -51,6 +51,12 @@ pub const SchemaParser = struct {
 
     pub fn parseSchema(self: *SchemaParser) SchemaParseError!schema.Schema {
         var types = std.StringHashMap(*schema.Type).init(self.allocator);
+        errdefer {
+            var iter = types.iterator();
+            while (iter.next()) |entry| {
+                entry.value_ptr.*.deinit(self.allocator);
+            }
+        }
         defer types.deinit();
 
         var query_type_name: ?[]const u8 = null;
@@ -105,8 +111,9 @@ pub const SchemaParser = struct {
     // --- Token helpers ---
 
     fn advance(self: *SchemaParser) SchemaParseError!void {
+        const new_token = try self.lexer.nextToken();
         self.freeToken(&self.current);
-        self.current = try self.lexer.nextToken();
+        self.current = new_token;
     }
 
     fn check(self: *SchemaParser, kind: Token.Kind) bool {

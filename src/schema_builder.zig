@@ -55,14 +55,18 @@ fn validateDef(comptime Def: type) void {
             @compileError("SchemaBuilder type '" ++ type_field.name ++ "' must be a struct of fields");
         }
 
+        // Skip validation for types with explicit kind (scalar, enum, union etc.) and auto-enums
+        if (comptime isAutoEnum(TypeDef) or hasExplicitKind(TypeDef)) continue;
+
+        // Object/interface/input: each field (except meta) must have .type
         inline for (type_info.@"struct".fields) |field_def| {
+            if (std.mem.eql(u8, field_def.name, "kind") or std.mem.eql(u8, field_def.name, "implements")) continue;
+
             const FieldType = field_def.type;
             const field_info = @typeInfo(FieldType);
             if (field_info != .@"struct") {
                 @compileError("SchemaBuilder field '" ++ type_field.name ++ "." ++ field_def.name ++ "' must be a struct with at least .type");
             }
-
-            // Check that .type exists
             const has_type = blk: {
                 var found = false;
                 for (field_info.@"struct".fields) |f| {
@@ -80,8 +84,63 @@ fn validateDef(comptime Def: type) void {
     }
 }
 
+/// Check if the type definition has an explicit .kind field.
+fn hasExplicitKind(comptime TypeDef: type) bool {
+    const type_info = @typeInfo(TypeDef);
+    if (type_info != .@"struct") return false;
+    inline for (type_info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, "kind")) return true;
+    }
+    return false;
+}
+
+/// Detect whether the type definition is an enum (all fields lack .type, and no explicit .kind).
+fn isAutoEnum(comptime TypeDef: type) bool {
+    const type_info = @typeInfo(TypeDef);
+    if (type_info != .@"struct" or type_info.@"struct".fields.len == 0) return false;
+    if (hasExplicitKind(TypeDef)) return false;
+
+    var all_enum = true;
+    inline for (type_info.@"struct".fields) |field_def| {
+        const FieldType = field_def.type;
+        const field_info = @typeInfo(FieldType);
+        if (field_info == .@"struct") {
+            inline for (field_info.@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, "type")) {
+                    all_enum = false;
+                }
+            }
+        } else {
+            all_enum = false;
+        }
+    }
+    return all_enum;
+}
+
+/// Get the type kind: "scalar", "enum", "interface", "input", or "type".
+/// Needs the actual value to read the .kind field.
+fn resolveKind(comptime type_value: anytype) []const u8 {
+    if (comptime isAutoEnum(@TypeOf(type_value))) return "enum";
+    if (comptime hasExplicitKind(@TypeOf(type_value))) {
+        return @field(type_value, "kind");
+    }
+    return "type";
+}
+
+/// Extract .implements value from type definition, or empty string.
+fn getImplements(comptime TypeDef: type, comptime type_value: anytype) []const u8 {
+    const type_info = @typeInfo(TypeDef);
+    inline for (type_info.@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, "implements")) {
+            return @field(type_value, "implements");
+        }
+    }
+    return "";
+}
+
 /// Generate SDL string from the compile-time definition using string concatenation.
 fn generateSDL(comptime def: anytype) []const u8 {
+    @setEvalBranchQuota(10000);
     var result: []const u8 = "";
     const Def = @TypeOf(def);
     const info = @typeInfo(Def);
@@ -93,16 +152,65 @@ fn generateSDL(comptime def: anytype) []const u8 {
     inline for (info.@"struct".fields) |type_field| {
         const type_name = type_field.name;
         const type_value = @field(def, type_name);
-
-        result = result ++ "type " ++ type_name ++ " {\n";
-
         const TypeDef = @TypeOf(type_value);
         const type_info = @typeInfo(TypeDef);
+        const kind = comptime resolveKind(type_value);
+        const implements_str = comptime getImplements(TypeDef, type_value);
+
+        if (std.mem.eql(u8, kind, "scalar")) {
+            result = result ++ "scalar " ++ type_name ++ "\n\n";
+            continue;
+        }
+
+        if (std.mem.eql(u8, kind, "union")) {
+            var members_str: []const u8 = "";
+            inline for (type_info.@"struct".fields) |f| {
+                if (std.mem.eql(u8, f.name, "members")) {
+                    members_str = @field(type_value, "members");
+                }
+            }
+            result = result ++ "union " ++ type_name ++ " = " ++ members_str ++ "\n\n";
+            continue;
+        }
+
+        if (std.mem.eql(u8, kind, "enum")) {
+            result = result ++ "enum " ++ type_name ++ " {\n";
+            inline for (type_info.@"struct".fields) |field_def| {
+                const field_name = field_def.name;
+                if (std.mem.eql(u8, field_name, "kind")) continue;
+                const field_value = @field(type_value, field_name);
+                var description: []const u8 = "";
+                const FieldType = @TypeOf(field_value);
+                const field_info = @typeInfo(FieldType);
+                if (field_info == .@"struct") {
+                    inline for (field_info.@"struct".fields) |f| {
+                        if (std.mem.eql(u8, f.name, "description")) {
+                            description = @field(field_value, "description");
+                        }
+                    }
+                }
+                if (description.len > 0) {
+                    result = result ++ "  \"\"\"\n  " ++ description ++ "\n  \"\"\"\n";
+                }
+                result = result ++ "  " ++ field_name ++ "\n";
+            }
+            result = result ++ "}\n\n";
+            continue;
+        }
+
+        // Object, interface, or input types with fields
+        result = result ++ kind ++ " " ++ type_name;
+        if (implements_str.len > 0) {
+            result = result ++ " implements " ++ implements_str;
+        }
+        result = result ++ " {\n";
+
         inline for (type_info.@"struct".fields) |field_def| {
             const field_name = field_def.name;
+            // Skip meta-fields
+            if (std.mem.eql(u8, field_name, "kind") or std.mem.eql(u8, field_name, "implements")) continue;
             const field_value = @field(type_value, field_name);
 
-            // Extract type string, args, and description
             var type_str: []const u8 = "";
             var args_str: []const u8 = "";
             var description: []const u8 = "";
@@ -130,8 +238,19 @@ fn generateSDL(comptime def: anytype) []const u8 {
     }
 
     // Add schema definition if Query type exists
-    if (has_query) {
-        result = result ++ "schema {\n  query: Query\n}\n";
+    var has_mutation = false;
+    var has_subscription = false;
+    inline for (info.@"struct".fields) |type_field| {
+        if (std.mem.eql(u8, type_field.name, "Mutation")) has_mutation = true;
+        if (std.mem.eql(u8, type_field.name, "Subscription")) has_subscription = true;
+    }
+
+    if (has_query or has_mutation or has_subscription) {
+        result = result ++ "schema {\n";
+        if (has_query) result = result ++ "  query: Query\n";
+        if (has_mutation) result = result ++ "  mutation: Mutation\n";
+        if (has_subscription) result = result ++ "  subscription: Subscription\n";
+        result = result ++ "}\n";
     }
 
     return result;
@@ -201,4 +320,85 @@ test "SchemaBuilder init parses SDL" {
 
     try std.testing.expectEqualStrings("Query", s.query_type.name);
     try std.testing.expect(s.getType("Query") != null);
+}
+
+test "SchemaBuilder enum and interface" {
+    const Builder = comptime SchemaBuilder(.{
+        .Query = .{
+            .user = .{ .type = "User" },
+            .status = .{ .type = "Status" },
+        },
+        .User = .{
+            .name = .{ .type = "String!" },
+        },
+        .Status = .{
+            .kind = "enum",
+            .ACTIVE = .{},
+            .INACTIVE = .{},
+        },
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "enum Status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "ACTIVE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "INACTIVE") != null);
+
+    // Parse and verify
+    const allocator = std.testing.allocator;
+    var s = try Builder.init(allocator);
+    defer s.deinit();
+
+    const status_type = s.getType("Status").?;
+    try std.testing.expect(status_type.isEnum());
+    try std.testing.expect(status_type.kind.enum_type.values.contains("ACTIVE"));
+}
+
+test "SchemaBuilder interface with implements" {
+    const Builder = comptime SchemaBuilder(.{
+        .Query = .{
+            .node = .{ .type = "Node" },
+        },
+        .Node = .{
+            .kind = "interface",
+            .id = .{ .type = "ID!" },
+        },
+        .User = .{
+            .implements = "Node",
+            .id = .{ .type = "ID!" },
+            .name = .{ .type = "String!" },
+        },
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "interface Node") != null);
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "implements Node") != null);
+
+    const allocator = std.testing.allocator;
+    var s = try Builder.init(allocator);
+    defer s.deinit();
+
+    const node_type = s.getType("Node").?;
+    try std.testing.expect(node_type.isInterface());
+
+    const user_type = s.getType("User").?;
+    try std.testing.expect(user_type.isObject());
+    try std.testing.expect(user_type.kind.object.interfaces.items.len > 0);
+}
+
+test "SchemaBuilder scalar" {
+    const Builder = comptime SchemaBuilder(.{
+        .Query = .{
+            .date = .{ .type = "Date" },
+        },
+        .Date = .{
+            .kind = "scalar",
+        },
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, Builder.sdl, "scalar Date") != null);
+
+    const allocator = std.testing.allocator;
+    var s = try Builder.init(allocator);
+    defer s.deinit();
+
+    const date_type = s.getType("Date").?;
+    try std.testing.expect(date_type.isScalar());
 }

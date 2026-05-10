@@ -40,14 +40,15 @@ pub const ResponseCache = struct {
         }
     }
 
-    /// Look up a cached response. Returns null if missing or expired.
+    /// Look up a cached response. Returns an owned copy, or null if missing/expired.
+    /// Caller owns the returned string and must free it.
     pub fn get(self: *ResponseCache, key: []const u8, now_ms: i64) ?[]const u8 {
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
 
         const entry = self.entries.get(key) orelse return null;
         if (entry.expires_at_ms < now_ms) return null;
-        return entry.response;
+        return self.allocator.dupe(u8, entry.response) catch null;
     }
 
     /// Store a response in the cache. If the key already exists, the old entry is replaced.
@@ -105,6 +106,8 @@ test "ResponseCache basic" {
     defer cache.deinit();
 
     try cache.put("query1", "{\"data\":{}}", 0);
-    try std.testing.expectEqualStrings("{\"data\":{}}", cache.get("query1", 0).?);
+    const hit = cache.get("query1", 0).?;
+    defer allocator.free(hit);
+    try std.testing.expectEqualStrings("{\"data\":{}}", hit);
     try std.testing.expect(cache.get("query1", 2000) == null); // expired
 }

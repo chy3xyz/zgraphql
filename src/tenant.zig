@@ -55,25 +55,53 @@ pub const TenantManager = struct {
         var iter = self.tenants.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            // Free display_name and roles copies
+            self.allocator.free(entry.value_ptr.display_name);
+            for (entry.value_ptr.roles) |role| {
+                self.allocator.free(role);
+            }
+            self.allocator.free(entry.value_ptr.roles);
         }
         self.tenants.deinit();
         if (self.default_tenant) |*dt| {
             self.allocator.free(dt.id);
             self.allocator.free(dt.display_name);
+            for (dt.roles) |role| {
+                self.allocator.free(role);
+            }
+            self.allocator.free(dt.roles);
+        }
+        // Free header_name if changed from default literal
+        if (!std.mem.eql(u8, self.header_name, "X-Tenant-ID")) {
+            self.allocator.free(self.header_name);
         }
     }
 
     /// Set the header name used for tenant resolution (default: X-Tenant-ID).
     pub fn setHeaderName(self: *TenantManager, name: []const u8) !void {
-        self.header_name = try self.allocator.dupe(u8, name);
+        const new_name = try self.allocator.dupe(u8, name);
+        // Free old value if previously changed from the default literal
+        if (!std.mem.eql(u8, self.header_name, "X-Tenant-ID")) {
+            self.allocator.free(self.header_name);
+        }
+        self.header_name = new_name;
     }
 
-    /// Register a new tenant. The tenant ID is copied.
+    /// Register a new tenant. The tenant ID, display_name, and roles are copied.
     pub fn register(self: *TenantManager, tenant: Tenant) !void {
         const id_copy = try self.allocator.dupe(u8, tenant.id);
         errdefer self.allocator.free(id_copy);
+        const display_copy = try self.allocator.dupe(u8, tenant.display_name);
+        errdefer self.allocator.free(display_copy);
+        const roles_copy = try self.allocator.alloc([]const u8, tenant.roles.len);
+        errdefer self.allocator.free(roles_copy);
+        for (tenant.roles, 0..) |role, i| {
+            roles_copy[i] = try self.allocator.dupe(u8, role);
+        }
         var tenant_copy = tenant;
         tenant_copy.id = id_copy;
+        tenant_copy.display_name = display_copy;
+        tenant_copy.roles = roles_copy;
         try self.tenants.put(id_copy, tenant_copy);
     }
 

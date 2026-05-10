@@ -62,6 +62,7 @@ pub const DistributedCache = struct {
         // L1 check
         if (self.local_l1) |l1| {
             if (l1.get(raw_key, now_ms)) |cached| {
+                defer l1.allocator.free(cached);
                 return try self.allocator.dupe(u8, cached);
             }
         }
@@ -115,8 +116,10 @@ pub const DistributedCache = struct {
 
     /// Convenience: store a GraphQL Value directly (serializes to JSON).
     pub fn setValue(self: *DistributedCache, raw_key: []const u8, value: Value, ttl_ms: u32, now_ms: i64) !void {
+        // Use the value's allocator to free, since toJson allocates with it
+        const val_allocator = value.allocator;
         const json_str = try value.toJson();
-        defer self.allocator.free(json_str);
+        defer val_allocator.free(json_str);
         try self.set(raw_key, json_str, ttl_ms, now_ms);
     }
 };

@@ -122,6 +122,7 @@ pub const Parser = struct {
         UnexpectedToken, ExpectedName, ExpectedKeyword,
         UnexpectedCharacter, UnterminatedString, InvalidEscape,
         InvalidCharacterInString, InvalidNumber,
+        DuplicateField,
     };
 
     fn parseType(self: *Parser) ParseError!ast.Type {
@@ -129,7 +130,7 @@ pub const Parser = struct {
         if (self.current.kind == .lbracket) {
             try self.advance();
             const inner = try self.allocator.create(ast.Type);
-            errdefer self.allocator.destroy(inner);
+            errdefer inner.deinit(self.allocator);
             inner.* = try self.parseType();
             try self.expect(.rbracket);
             result = .{ .list = inner };
@@ -296,10 +297,22 @@ pub const Parser = struct {
                 }
                 while (self.current.kind != .rbrace) {
                     const key = try self.allocator.dupe(u8, try self.expectName());
-                    errdefer self.allocator.free(key);
                     try self.expect(.colon);
-                    const value = try self.parseValue();
-                    try obj.put(key, value);
+                    var value = self.parseValue() catch |err| {
+                        self.allocator.free(key);
+                        return err;
+                    };
+                    const gop = obj.getOrPut(key) catch |err| {
+                        self.allocator.free(key);
+                        value.deinit(self.allocator);
+                        return err;
+                    };
+                    if (gop.found_existing) {
+                        self.allocator.free(key);
+                        value.deinit(self.allocator);
+                        return error.DuplicateField;
+                    }
+                    gop.value_ptr.* = value;
                 }
                 try self.expect(.rbrace);
                 return .{ .object_value = obj };
@@ -311,8 +324,9 @@ pub const Parser = struct {
     // Helpers
 
     fn advance(self: *Parser) !void {
+        const new_token = try self.lexer.nextToken();
         self.freeToken(&self.current);
-        self.current = try self.lexer.nextToken();
+        self.current = new_token;
     }
 
     fn freeToken(self: *Parser, token: *Token) void {
@@ -427,4 +441,14 @@ test "parser complex value" {
     const op = doc.definitions.items[0].operation;
     const field = op.selection_set.selections.items[0].field;
     try std.testing.expectEqual(@as(usize, 1), field.arguments.items.len);
+}
+
+test "parser duplicate object field" {
+    const allocator = std.testing.allocator;
+    // Duplicate key "query" in input object should fail
+    var parser = try Parser.init(allocator,
+        \\{ search(input: { query: "a", query: "b" }) }
+    );
+    defer parser.deinit();
+    try std.testing.expectError(error.DuplicateField, parser.parseDocument());
 }

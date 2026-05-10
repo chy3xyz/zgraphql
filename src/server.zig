@@ -45,12 +45,9 @@ fn unregisterServerForSignals(server: *GraphQLServer) void {
 fn signalHandler(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
     _ = info;
     _ = ctx;
-    const signame = switch (sig) {
-        std.posix.SIG.INT => "SIGINT",
-        std.posix.SIG.TERM => "SIGTERM",
-        else => "unknown",
-    };
-    log.info("received {s}, initiating graceful shutdown for all registered instances", .{signame});
+    _ = sig;
+    // Only set shutdown flags — logging is not async-signal-safe.
+    // The main loop will log "shutdown requested" when it detects the flag.
     for (g_server_registry) |maybe_server| {
         if (maybe_server) |server| {
             server.shutdown();
@@ -176,7 +173,16 @@ pub const GraphQLServer = struct {
         defer {
             log.info("waiting for active requests to complete...", .{});
             group.cancel(io);
-            log.info("shutdown complete", .{});
+            // Wait up to 10 seconds for in-flight requests to drain
+            var wait_iter: u32 = 0;
+            while (self.active_requests.load(.acquire) > 0 and wait_iter < 200) : (wait_iter += 1) {
+                std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake) catch break;
+            }
+            if (self.active_requests.load(.acquire) > 0) {
+                log.warn("shutdown with {d} active requests still pending", .{self.active_requests.load(.acquire)});
+            } else {
+                log.info("shutdown complete", .{});
+            }
         }
 
         while (!self.shutdown_requested.load(.acquire)) {
@@ -305,6 +311,10 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
     var had_error = true; // default to error; success paths clear it
     var query_str: ?[]const u8 = null;
     var operation_name: ?[]const u8 = null;
+    defer {
+        if (query_str) |q| self.allocator.free(q);
+        if (operation_name) |o| self.allocator.free(o);
+    }
 
     // Distributed tracing: create root span if tracer is configured.
     var trace_span: ?zg.TraceSpan = null;
@@ -360,7 +370,27 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
             try sendGraphQLErrorResponse(self.allocator, request, "Missing Sec-WebSocket-Key", .bad_request, origin);
             return;
         };
-        var ws = try request.respondWebSocket(.{ .key = key });
+        // Echo Sec-WebSocket-Protocol if client requests graphql-transport-ws
+        var ws_extra: [1]std.http.Header = undefined;
+        var ws_extra_count: usize = 0;
+        blk: {
+            const buf = request.head_buffer;
+            const needle = "sec-websocket-protocol:";
+            var i: usize = 0;
+            while (i + needle.len < buf.len) : (i += 1) {
+                if (std.ascii.eqlIgnoreCase(buf[i .. i + needle.len], needle)) {
+                    const val_start = i + needle.len;
+                    const val_end = std.mem.indexOf(u8, buf[val_start..], "\r\n") orelse break;
+                    const proto = std.mem.trim(u8, buf[val_start .. val_start + val_end], " \t");
+                    if (std.ascii.indexOfIgnoreCase(proto, "graphql-transport-ws") != null) {
+                        ws_extra[0] = .{ .name = "sec-websocket-protocol", .value = "graphql-transport-ws" };
+                        ws_extra_count = 1;
+                    }
+                    break :blk;
+                }
+            }
+        }
+        var ws = try request.respondWebSocket(.{ .key = key, .extra_headers = ws_extra[0..ws_extra_count] });
         try ws.output.flush();
         try handleWebSocket(self, io, &ws);
         had_error = false;
@@ -515,10 +545,10 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
 
         const obj = root.object;
         if (obj.get("query")) |q| {
-            if (q == .string) query_str = q.string;
+            if (q == .string) query_str = try self.allocator.dupe(u8, q.string);
         }
         if (obj.get("operationName")) |op| {
-            if (op == .string) operation_name = op.string;
+            if (op == .string) operation_name = try self.allocator.dupe(u8, op.string);
         }
         if (obj.get("variables")) |vars| {
             if (vars == .object) {
@@ -559,9 +589,9 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
                 const key = param[0..eq];
                 const val = std.Uri.percentDecodeInPlace(@constCast(param[eq + 1 ..]));
                 if (std.mem.eql(u8, key, "query")) {
-                    query_str = val;
+                    query_str = try self.allocator.dupe(u8, val);
                 } else if (std.mem.eql(u8, key, "operationName")) {
-                    operation_name = val;
+                    operation_name = try self.allocator.dupe(u8, val);
                 } else if (std.mem.eql(u8, key, "variables")) {
                     const vars_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, val, .{}) catch continue;
                     defer vars_parsed.deinit();
@@ -758,9 +788,8 @@ fn executeGraphQLAndGetJson(
 
     if (!validation_result.isValid()) {
         var error_json = Value.initObject(self.allocator);
-        errdefer error_json.deinit();
+        defer error_json.deinit();
         var errors = Value.initList(self.allocator);
-        defer errors.deinit();
         for (validation_result.errors.items) |err| {
             var err_obj = Value.initObject(self.allocator);
             try err_obj.data.object.put(try self.allocator.dupe(u8, "message"), Value.fromString(self.allocator, try self.allocator.dupe(u8, err.message)));
@@ -881,11 +910,7 @@ fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) st
 }
 
 fn readRequestBody(allocator: std.mem.Allocator, request: *http.Server.Request) ![]u8 {
-    const len = request.head.content_length orelse return "";
-    if (len == 0) return "";
-
-    const body = try allocator.alloc(u8, @intCast(len));
-    errdefer allocator.free(body);
+    const len = request.head.content_length orelse 0;
 
     var transfer_buffer: [4096]u8 = undefined;
     const body_reader = request.server.reader.bodyReader(
@@ -894,10 +919,26 @@ fn readRequestBody(allocator: std.mem.Allocator, request: *http.Server.Request) 
         request.head.content_length,
     );
 
-    var writer = Io.Writer.fixed(body);
-    try body_reader.streamExact(&writer, @intCast(len));
+    if (len > 0) {
+        const body = try allocator.alloc(u8, @intCast(len));
+        errdefer allocator.free(body);
+        var writer = Io.Writer.fixed(body);
+        try body_reader.streamExact(&writer, @intCast(len));
+        return body;
+    }
 
-    return body;
+    // Chunked transfer encoding — body reader handles chunked decoding.
+    // Read with a generous buffer limit (10MB).
+    if (request.head.transfer_encoding == .chunked) {
+        const max_size = 10 * 1024 * 1024;
+        const body = try allocator.alloc(u8, max_size);
+        errdefer allocator.free(body);
+        var writer = Io.Writer.fixed(body);
+        const n = try body_reader.stream(&writer, Io.Limit.limited(max_size));
+        return body[0..n];
+    }
+
+    return "";
 }
 
 fn resolveCorsOrigin(options: ServerOptions, head_buffer: []const u8) []const u8 {
@@ -1353,7 +1394,6 @@ fn consumeSubscription(
         log.err("websocket write error (subscription complete): {s}", .{@errorName(werr)});
     };
 
-    stream.deinit(self.allocator);
 }
 
 /// Handle WebSocket connection using graphql-ws protocol.
@@ -1508,6 +1548,8 @@ fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket) !vo
                 if (active_subs.getPtr(id)) |existing| {
                     existing.stream.cancel();
                     _ = existing.future.cancel(io) catch {};
+                    // Await to ensure the future finishes before we free its resources
+                    _ = existing.future.await(io) catch {};
                     self.allocator.free(existing.id);
                     _ = active_subs.remove(id);
                 }
@@ -2119,7 +2161,6 @@ const simple_playground_html =
     \\    .status { padding: 4px 12px; font-size: 12px; background: #252526; border-top: 1px solid #333; }
     \\  </style>
     \\</head>
-    \\</html>
     \\<body>
     \\  <div class="pane">
     \\    <h2>Query</h2>
@@ -2183,7 +2224,6 @@ const graphiql_html =
     \\  <link rel="stylesheet" crossorigin href="https://unpkg.com/graphiql@3/graphiql.min.css" />
     \\  <style>body{margin:0;height:100vh;}#root{height:100vh;}</style>
     \\</head>
-    \\</html>
     \\<body>
     \\  <div id="root"></div>
     \\  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>

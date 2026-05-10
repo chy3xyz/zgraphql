@@ -58,6 +58,9 @@ pub const Validator = struct {
     pub fn validate(self: *Validator, doc: *ast.Document) !ValidationResult {
         self.result = ValidationResult.init(self.allocator);
 
+        // Clear stale state from previous validation (prevents UAF on reuse)
+        self.fragments.clearRetainingCapacity();
+
         // Collect fragments
         for (doc.definitions.items) |*def| {
             switch (def.*) {
@@ -87,11 +90,21 @@ pub const Validator = struct {
             try self.detectFragmentCycles(entry.key_ptr.*, entry.value_ptr.*, &visited);
         }
 
-        // Validate definitions
+        // Validate definitions. Fragments are validated on-demand when spread
+        // from operations, so that variable references resolve correctly.
+        var validated_fragments = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var vf_iter = validated_fragments.iterator();
+            while (vf_iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            validated_fragments.deinit();
+        }
+
         for (doc.definitions.items) |*def| {
             switch (def.*) {
-                .operation => |*op| try self.validateOperation(op),
-                .fragment => |*frag| try self.validateFragment(frag),
+                .operation => |*op| try self.validateOperation(op, &validated_fragments),
+                .fragment => {}, // validated on-demand from operations
             }
         }
 
@@ -134,7 +147,7 @@ pub const Validator = struct {
         }
     }
 
-    fn validateOperation(self: *Validator, op: *ast.OperationDefinition) !void {
+    fn validateOperation(self: *Validator, op: *ast.OperationDefinition, validated_fragments: *std.StringHashMap(void)) !void {
         const root_type = switch (op.op_type) {
             .query => self.schema_def.query_type,
             .mutation => self.schema_def.mutation_type orelse {
@@ -165,7 +178,7 @@ pub const Validator = struct {
         };
         try self.validateDirectives(op.directives, op_location);
 
-        try self.validateSelectionSet(&op.selection_set, root_type);
+        try self.validateSelectionSet(&op.selection_set, root_type, validated_fragments);
 
         // Clean up variables for this operation
         var iter = self.variables.iterator();
@@ -175,35 +188,81 @@ pub const Validator = struct {
         self.variables.clearRetainingCapacity();
     }
 
-    fn validateFragment(self: *Validator, frag: *ast.FragmentDefinition) !void {
+    fn validateFragment(self: *Validator, frag: *ast.FragmentDefinition, validated_fragments: *std.StringHashMap(void)) !void {
         const type_name = frag.type_condition.name;
         const frag_type = self.schema_def.getType(type_name);
         if (frag_type == null) {
             try self.result.addError("Fragment type condition does not exist in schema", frag.line, frag.col);
             return;
         }
+        if (!frag_type.?.isComposite()) {
+            try self.result.addError("Fragment type condition must be a composite type (object, interface, or union)", frag.line, frag.col);
+            return;
+        }
         try self.validateDirectives(frag.directives, .fragment_definition);
-        try self.validateSelectionSet(&frag.selection_set, frag_type.?);
+        try self.validateSelectionSet(&frag.selection_set, frag_type.?, validated_fragments);
     }
 
     const ValidateError = std.mem.Allocator.Error || error{UnexpectedToken};
 
-    fn validateSelectionSet(self: *Validator, ss: *ast.SelectionSet, parent_type: *schema.Type) ValidateError!void {
+    fn validateSelectionSet(self: *Validator, ss: *ast.SelectionSet, parent_type: *schema.Type, validated_fragments: *std.StringHashMap(void)) ValidateError!void {
         if (!parent_type.isComposite()) {
             try self.result.addError("Selection set only allowed on composite types", null, null);
             return;
         }
 
+        if (ss.selections.items.len == 0) {
+            try self.result.addError("Selection set must not be empty on composite type", null, null);
+            return;
+        }
+
         for (ss.selections.items) |*sel| {
             switch (sel.*) {
-                .field => |*field| try self.validateField(field, parent_type),
-                .fragment_spread => |*fs| try self.validateFragmentSpread(fs, parent_type),
-                .inline_fragment => |*ifrag| try self.validateInlineFragment(ifrag, parent_type),
+                .field => |*field| try self.validateField(field, parent_type, validated_fragments),
+                .fragment_spread => |*fs| try self.validateFragmentSpread(fs, parent_type, validated_fragments),
+                .inline_fragment => |*ifrag| try self.validateInlineFragment(ifrag, parent_type, validated_fragments),
             }
         }
     }
 
-    fn validateField(self: *Validator, field: *ast.Field, parent_type: *schema.Type) ValidateError!void {
+    fn validateField(self: *Validator, field: *ast.Field, parent_type: *schema.Type, validated_fragments: *std.StringHashMap(void)) ValidateError!void {
+        // GraphQL introspection meta-fields are always valid
+        if (std.mem.eql(u8, field.name, "__typename")) {
+            if (field.selection_set != null) {
+                try self.result.addError("__typename must not have a sub-selection", field.line, field.col);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, field.name, "__schema")) {
+            try self.validateDirectives(field.directives, .field);
+            if (field.selection_set) |*ss| {
+                const schema_type = self.schema_def.getType("__Schema");
+                if (schema_type) |st| {
+                    try self.validateSelectionSet(ss, st, validated_fragments);
+                }
+            }
+            return;
+        }
+        if (std.mem.eql(u8, field.name, "__type")) {
+            try self.validateDirectives(field.directives, .field);
+            for (field.arguments.items) |arg| {
+                if (std.mem.eql(u8, arg.name, "name")) {
+                    if (arg.value != .string_value) {
+                        try self.result.addError("__type name argument must be a string", field.line, field.col);
+                    }
+                } else {
+                    try self.result.addError("Unknown argument on __type", field.line, field.col);
+                }
+            }
+            if (field.selection_set) |*ss| {
+                const type_type = self.schema_def.getType("__Type");
+                if (type_type) |tt| {
+                    try self.validateSelectionSet(ss, tt, validated_fragments);
+                }
+            }
+            return;
+        }
+
         const field_def = parent_type.getField(field.name);
         if (field_def == null) {
             try self.result.addError("Field does not exist on type", field.line, field.col);
@@ -211,6 +270,16 @@ pub const Validator = struct {
         }
 
         try self.validateDirectives(field.directives, .field);
+
+        // Check argument uniqueness
+        for (field.arguments.items, 0..) |*arg, i| {
+            for (field.arguments.items[i + 1 ..]) |*other| {
+                if (std.mem.eql(u8, arg.name, other.name)) {
+                    try self.result.addError("Duplicate argument name", field.line, field.col);
+                    break;
+                }
+            }
+        }
 
         // Validate arguments
         for (field.arguments.items) |arg| {
@@ -222,17 +291,38 @@ pub const Validator = struct {
             try self.validateArgumentValue(arg.value, arg_def.?.value_type);
         }
 
+        // Check that all required (NonNull) arguments are provided
+        var arg_iter = field_def.?.arguments.iterator();
+        while (arg_iter.next()) |entry| {
+            if (entry.value_ptr.value_type.isNonNull()) {
+                var found = false;
+                for (field.arguments.items) |a| {
+                    if (std.mem.eql(u8, a.name, entry.key_ptr.*)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try self.result.addError("Missing required argument", field.line, field.col);
+                }
+            }
+        }
+
         // Validate sub-selection
         if (field.selection_set) |*ss| {
             const field_type_name = field_def.?.field_type.innerTypeName();
             const field_type = self.schema_def.getType(field_type_name);
             if (field_type) |ft| {
-                try self.validateSelectionSet(ss, ft);
+                if (!ft.isComposite()) {
+                    try self.result.addError("Leaf field must not have a sub-selection", field.line, field.col);
+                    return;
+                }
+                try self.validateSelectionSet(ss, ft, validated_fragments);
             }
         }
     }
 
-    fn validateFragmentSpread(self: *Validator, fs: *ast.FragmentSpread, parent_type: *schema.Type) ValidateError!void {
+    fn validateFragmentSpread(self: *Validator, fs: *ast.FragmentSpread, parent_type: *schema.Type, validated_fragments: *std.StringHashMap(void)) ValidateError!void {
         try self.validateDirectives(fs.directives, .fragment_spread);
         const frag = self.fragments.get(fs.name);
         if (frag == null) {
@@ -246,9 +336,15 @@ pub const Validator = struct {
                 try self.result.addError("Fragment type condition not applicable here", fs.line, fs.col);
             }
         }
+        // Validate fragment internals with operation's variables in scope
+        if (!validated_fragments.contains(fs.name)) {
+            const key = try self.allocator.dupe(u8, fs.name);
+            try validated_fragments.put(key, {});
+            try self.validateFragment(frag.?, validated_fragments);
+        }
     }
 
-    fn validateInlineFragment(self: *Validator, ifrag: *ast.InlineFragment, parent_type: *schema.Type) ValidateError!void {
+    fn validateInlineFragment(self: *Validator, ifrag: *ast.InlineFragment, parent_type: *schema.Type, validated_fragments: *std.StringHashMap(void)) ValidateError!void {
         try self.validateDirectives(ifrag.directives, .inline_fragment);
         if (ifrag.type_condition) |tc| {
             const tc_type = self.schema_def.getType(tc.name);
@@ -259,9 +355,9 @@ pub const Validator = struct {
             if (!self.isTypeSubType(parent_type, tc_type.?)) {
                 try self.result.addError("Inline fragment type condition not applicable here", ifrag.line, ifrag.col);
             }
-            try self.validateSelectionSet(&ifrag.selection_set, tc_type.?);
+            try self.validateSelectionSet(&ifrag.selection_set, tc_type.?, validated_fragments);
         } else {
-            try self.validateSelectionSet(&ifrag.selection_set, parent_type);
+            try self.validateSelectionSet(&ifrag.selection_set, parent_type, validated_fragments);
         }
     }
 
@@ -365,13 +461,20 @@ pub const Validator = struct {
     fn isVariableTypeCompatible(self: *Validator, var_type: ast.Type, expected: schema.TypeRef) bool {
         switch (var_type) {
             .named => |n| {
-                return expected.kind == .named and std.mem.eql(u8, n.name, expected.kind.named);
+                if (expected.kind != .named) return false;
+                return std.mem.eql(u8, n.name, expected.kind.named);
             },
             .non_null => |ptr| {
-                if (expected.kind != .non_null) return false;
-                return self.isVariableTypeCompatible(ptr.*, expected.kind.non_null.*);
+                if (expected.kind == .non_null) {
+                    return self.isVariableTypeCompatible(ptr.*, expected.kind.non_null.*);
+                }
+                // A non-null variable can be used where a nullable type is expected
+                return self.isVariableTypeCompatible(ptr.*, expected);
             },
             .list => |ptr| {
+                if (expected.kind == .non_null) {
+                    return self.isVariableTypeCompatible(var_type, expected.kind.non_null.*);
+                }
                 if (expected.kind != .list) return false;
                 return self.isVariableTypeCompatible(ptr.*, expected.kind.list.*);
             },
@@ -463,6 +566,15 @@ pub const Validator = struct {
                         continue;
                     }
                     try self.validateArgumentValue(field_value, input_field.?.value_type);
+                }
+                // Check that all required (NonNull) input fields are provided
+                var field_iter = input_type.?.kind.input_object.fields.iterator();
+                while (field_iter.next()) |entry| {
+                    if (entry.value_ptr.value_type.isNonNull()) {
+                        if (!obj.contains(entry.key_ptr.*)) {
+                            try self.result.addError("Missing required input object field", null, null);
+                        }
+                    }
                 }
             },
         }

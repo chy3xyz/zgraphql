@@ -164,7 +164,7 @@ pub const DataLoader = struct {
 
         // Yield to allow concurrent fibers to queue their keys.
         // On most Io backends, sleep(0) will yield the fiber.
-        std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(0), .monotonic) catch |err| switch (err) {
+        std.Io.sleep(self.io, std.Io.Duration.fromNanoseconds(0), .awake) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
         };
 
@@ -186,7 +186,10 @@ pub const DataLoader = struct {
                 }
 
                 const values = try batch_fn(self.batch_ctx, self.allocator, keys_list.items);
-                defer self.allocator.free(values);
+                defer {
+                    for (values) |*v| v.deinit();
+                    self.allocator.free(values);
+                }
 
                 if (values.len != keys_list.items.len) return error.BatchLoadFailed;
 

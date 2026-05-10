@@ -142,7 +142,11 @@ pub const Executor = struct {
 
         var src_iter = variables.iterator();
         while (src_iter.next()) |entry| {
-            try self.context.variables.put(try self.allocator.dupe(u8, entry.key_ptr.*), try entry.value_ptr.clone());
+            const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(key);
+            var val = try entry.value_ptr.clone();
+            errdefer val.deinit();
+            try self.context.variables.put(key, val);
         }
     }
 
@@ -196,6 +200,17 @@ pub const Executor = struct {
         }
 
         const op = op_def orelse return error.ResolverError;
+
+        // Fill in default values for variables not provided by the client
+        for (op.variable_definitions.items) |*vd| {
+            if (!self.context.variables.contains(vd.name)) {
+                if (vd.default_value) |*dv| {
+                    const default_val = try self.coerceValue(dv.*);
+                    try self.context.variables.put(try self.allocator.dupe(u8, vd.name), default_val);
+                }
+            }
+        }
+
         return try self.executeOperation(op);
     }
 
@@ -297,8 +312,30 @@ pub const Executor = struct {
         }
 
         for (sub_field.arguments.items) |arg| {
-            const arg_value = try self.coerceValue(arg.value);
-            try args.put(try self.allocator.dupe(u8, arg.name), arg_value);
+            var arg_value = try self.coerceValue(arg.value);
+            const arg_key = try self.allocator.dupe(u8, arg.name);
+            errdefer self.allocator.free(arg_key);
+            args.put(arg_key, arg_value) catch |err| {
+                arg_value.deinit();
+                self.allocator.free(arg_key);
+                return err;
+            };
+        }
+
+        // Fill in default values for missing arguments from schema
+        var sub_def_iter = field_def.arguments.iterator();
+        while (sub_def_iter.next()) |entry| {
+            if (args.contains(entry.key_ptr.*)) continue;
+            if (entry.value_ptr.default_value) |dv| {
+                var default_clone = try dv.clone();
+                errdefer default_clone.deinit();
+                const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                args.put(key, default_clone) catch |err| {
+                    default_clone.deinit();
+                    self.allocator.free(key);
+                    return err;
+                };
+            }
         }
 
         const subscribe_fn = field_def.subscribe orelse return error.ResolverError;
@@ -472,18 +509,38 @@ pub const Executor = struct {
             futures.deinit();
         }
 
+        // Pre-allocate capacity to avoid OOM after concurrent tasks start
+        futures.ensureTotalCapacity(field_ptrs.items.len) catch {
+            // Fallback: sequential execution for all fields
+            for (field_ptrs.items, 0..) |field, i| {
+                const field_path = try self.dupePath(path_prefix, keys.items[i]);
+                defer self.freePath(field_path);
+                const field_value = self.executeFieldWithPath(field, parent_type, parent_value, field_path) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => |e| blk: {
+                        try self.recordError(e, keys.items[i], field_path);
+                        const fd = parent_type.getField(field.name);
+                        if (fd != null and fd.?.field_type.isNonNull()) {
+                            return e;
+                        }
+                        break :blk Value.fromNull(self.allocator);
+                    },
+                };
+                try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
+            }
+            return result;
+        };
+
         var all_concurrent = true;
         for (field_ptrs.items, 0..) |field, i| {
             const task_path = try self.dupePath(path_prefix, keys.items[i]);
-            errdefer self.freePath(task_path);
-            const future = std.Io.concurrent(self.context.io, executeFieldTaskWithPath, .{ self, field, parent_type, parent_value, task_path }) catch |err| switch (err) {
-                error.ConcurrencyUnavailable => {
-                    self.freePath(task_path);
-                    all_concurrent = false;
-                    break;
-                },
+            const future = std.Io.concurrent(self.context.io, executeFieldTaskWithPath, .{ self, field, parent_type, parent_value, task_path }) catch {
+                self.freePath(task_path);
+                all_concurrent = false;
+                break;
             };
-            try futures.append(future);
+            // Safe: capacity was pre-allocated; task_path is now owned by the future
+            futures.appendAssumeCapacity(future);
         }
 
         if (all_concurrent and futures.items.len == field_ptrs.items.len) {
@@ -516,7 +573,13 @@ pub const Executor = struct {
             return result;
         }
 
-        // Fallback: sequential execution
+        // Fallback: cancel any started futures, then execute all fields sequentially
+        for (futures.items) |*f| {
+            _ = f.cancel(self.context.io) catch {};
+            _ = f.await(self.context.io) catch {};
+        }
+        futures.clearRetainingCapacity();
+
         for (field_ptrs.items, 0..) |field, i| {
             const field_path = try self.dupePath(path_prefix, keys.items[i]);
             defer self.freePath(field_path);
@@ -540,10 +603,23 @@ pub const Executor = struct {
     fn executeSubSelection(self: *Executor, ss: *ast.SelectionSet, field_def: schema.Field, parent_value: Value, path: []const []const u8) ExecutionError!Value {
         const field_type_name = field_def.field_type.innerTypeName();
         const field_type = self.schema_def.getType(field_type_name);
-        if (field_type == null) return parent_value;
+        if (field_type == null) {
+            const clone = try parent_value.clone();
+            return clone;
+        }
 
-        if (field_def.field_type.isList()) {
-            // Execute selection set per list element
+        // Unwrap NonNull to check for list type (handles [T!]! and [T!] patterns)
+        const outer_is_non_null = field_def.field_type.isNonNull();
+        const list_elem_type = blk: {
+            var t = field_def.field_type;
+            if (t.isNonNull()) t = t.kind.non_null.*;
+            if (t.isList()) break :blk t.kind.list.*;
+            break :blk null;
+        };
+        if (list_elem_type) |elem_type| {
+            // Execute selection set per list element.
+            // For [T!] (non-null element), a null element must bubble to null the whole list.
+            const elem_non_null = elem_type.kind == .non_null;
             var results = Value.initList(self.allocator);
             errdefer results.deinit();
             if (parent_value.data == .list) {
@@ -552,6 +628,12 @@ pub const Executor = struct {
                         error.OutOfMemory => return err,
                         else => |e| blk: {
                             try self.recordError(e, field_def.name, path);
+                            if (elem_non_null) {
+                                results.deinit();
+                                // If outer type is also non-null, bubble further
+                                if (outer_is_non_null) return error.NullValueForNonNull;
+                                return Value.fromNull(self.allocator);
+                            }
                             break :blk Value.fromNull(self.allocator);
                         },
                     };
@@ -601,10 +683,24 @@ pub const Executor = struct {
             }
         }
 
+        // If parent is interface and fragment type is object that implements the interface
+        if (parent_type.isInterface() and fragment_type.isObject()) {
+            for (fragment_type.kind.object.interfaces.items) |iface| {
+                if (std.mem.eql(u8, iface, parent_type.name)) return true;
+            }
+        }
+
         // If fragment type is union and parent is a member
         if (fragment_type.isUnion()) {
             for (fragment_type.kind.union_type.possible_types.items) |pt| {
                 if (std.mem.eql(u8, pt, parent_type.name)) return true;
+            }
+        }
+
+        // If parent is union and fragment type is a member
+        if (parent_type.isUnion()) {
+            for (parent_type.kind.union_type.possible_types.items) |pt| {
+                if (std.mem.eql(u8, pt, fragment_type.name)) return true;
             }
         }
 
@@ -681,6 +777,15 @@ pub const Executor = struct {
     fn executeFieldWithPath(self: *Executor, field: *ast.Field, parent_type: *schema.Type, parent_value: Value, path: []const []const u8) ExecutionError!Value {
         // GraphQL introspection meta-fields
         if (std.mem.eql(u8, field.name, "__typename")) {
+            // If the parent value has an explicit __typename (set by resolver for
+            // interface/union runtime types), use it. Otherwise fall back to schema type name.
+            if (parent_value.data == .object) {
+                if (parent_value.data.object.get("__typename")) |tn| {
+                    if (tn.data == .string) {
+                        return Value.fromString(self.allocator, try self.allocator.dupe(u8, tn.data.string));
+                    }
+                }
+            }
             return Value.fromString(self.allocator, try self.allocator.dupe(u8, parent_type.name));
         }
         if (std.mem.eql(u8, field.name, "__schema") and self.schema_def.query_type == parent_type) {
@@ -692,6 +797,11 @@ pub const Executor = struct {
                 if (std.mem.eql(u8, arg.name, "name")) {
                     switch (arg.value) {
                         .string_value => |s| type_name = s,
+                        .variable => |var_name| {
+                            if (self.context.variables.get(var_name)) |v| {
+                                if (v.data == .string) type_name = v.data.string;
+                            }
+                        },
                         else => {},
                     }
                 }
@@ -757,8 +867,30 @@ pub const Executor = struct {
         }
 
         for (field.arguments.items) |arg| {
-            const arg_value = try self.coerceValue(arg.value);
-            try args.put(try self.allocator.dupe(u8, arg.name), arg_value);
+            var arg_value = try self.coerceValue(arg.value);
+            const arg_key = try self.allocator.dupe(u8, arg.name);
+            errdefer self.allocator.free(arg_key);
+            args.put(arg_key, arg_value) catch |err| {
+                arg_value.deinit();
+                self.allocator.free(arg_key);
+                return err;
+            };
+        }
+
+        // Fill in default values for missing arguments from schema
+        var def_iter = field_def.?.arguments.iterator();
+        while (def_iter.next()) |entry| {
+            if (args.contains(entry.key_ptr.*)) continue;
+            if (entry.value_ptr.default_value) |dv| {
+                var default_clone = try dv.clone();
+                errdefer default_clone.deinit();
+                const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                args.put(key, default_clone) catch |err| {
+                    default_clone.deinit();
+                    self.allocator.free(key);
+                    return err;
+                };
+            }
         }
 
         // Call resolver if present
@@ -1623,5 +1755,84 @@ test "executor @include directive" {
     const data2 = result2.data.object.get("data") orelse return error.TestUnexpectedResult;
     const hello2 = data2.data.object.get("hello") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.eql(u8, hello2.data.string, "world"));
+}
+
+test "executor __typename from schema type" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    var hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
+    hello_field.resolve = struct {
+        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!Value {
+            return Value.fromString(alloc, try alloc.dupe(u8, "world"));
+        }
+    }.resolve;
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var parser = try @import("parser.zig").Parser.init(allocator, "{ __typename }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var executor = Executor.init(allocator, &schema_def, backend.io());
+    defer executor.deinit();
+
+    var result = try executor.execute(&doc);
+    defer result.deinit();
+
+    const data = result.data.object.get("data").?.data.object;
+    try std.testing.expectEqualStrings("Query", data.get("__typename").?.data.string);
+}
+
+test "executor __typename from runtime value" {
+    const allocator = std.testing.allocator;
+
+    const node_type = try allocator.create(schema.Type);
+    node_type.* = .{ .name = "Node", .kind = .{ .interface = schema.InterfaceType.init(allocator) } };
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    var node_field = schema.Field.init(allocator, "node", schema.TypeRef.named("Node"));
+    node_field.resolve = struct {
+        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!Value {
+            var obj = Value.initObject(alloc);
+            try obj.data.object.put(try alloc.dupe(u8, "__typename"), Value.fromString(alloc, try alloc.dupe(u8, "User")));
+            try obj.data.object.put(try alloc.dupe(u8, "name"), Value.fromString(alloc, try alloc.dupe(u8, "Alice")));
+            return obj;
+        }
+    }.resolve;
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "node"), node_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Node", node_type);
+
+    var parser = try @import("parser.zig").Parser.init(allocator, "{ node { __typename name } }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var executor = Executor.init(allocator, &schema_def, backend.io());
+    defer executor.deinit();
+
+    var result = try executor.execute(&doc);
+    defer result.deinit();
+
+    const node = result.data.object.get("data").?.data.object.get("node").?.data.object;
+    try std.testing.expectEqualStrings("User", node.get("__typename").?.data.string);
 }
 
