@@ -45,6 +45,7 @@ A **production-ready** GraphQL library for **Zig 0.16.0**, built with zero exter
 | **Distributed Cache** | Built-in two-tier cache (L1 local + L2 remote) with pluggable backends (HTTP, custom) |
 | **Tenant Isolation** | Per-tenant schema overrides, rate limits, complexity limits, and query whitelists |
 | **Field Auth** | Role-based access control via `ExecutionHooks` |
+| **Playground** | Built-in GraphQL IDE at `/graphql/playground` (zero-dependency offline mode + GraphiQL CDN mode) |
 
 [Chinese README](README.zh.md)
 
@@ -510,7 +511,7 @@ zig build run-stress-test
 | Safety | 9/10 | Integer rate limiting, CORS fixes, signal registry, leak-free |
 | Documentation | 9/10 | Bilingual docs, architecture guide, API reference |
 | Performance | 8/10 | ~501 ops/sec sustained, lock-free metrics, L1+L2 caching |
-| Features | 10/10 | Complete GraphQL spec + distributed cache + tenant isolation |
+| Features | 10/10 | Complete GraphQL spec + distributed cache + tenant isolation + playground |
 | Maturity | 9/10 | Built-in distributed cache and tenant isolation |
 
 **Remaining gaps**:

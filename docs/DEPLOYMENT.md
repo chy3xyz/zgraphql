@@ -210,7 +210,27 @@ var server = zg.GraphQLServer.init(allocator, &schema_def, .{
 
 Tenants are resolved via the `X-Tenant-ID` header by default. Each request is subject to the tenant's configured limits. If no tenant matches and no default tenant is set, the global server options are used.
 
-### 9. Horizontal Scaling
+### 9. Playground
+
+Enable the built-in GraphQL IDE for development:
+
+```zig
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .enable_playground = true,
+});
+```
+
+Navigate to `http://localhost:8080/graphql/playground`.
+
+- **Offline mode** (default): a zero-dependency minimal playground with query editing, variable input, response formatting, and introspection.
+- **CDN mode**: replace the HTML with `graphiql_html` in `server.zig` to serve GraphiQL via CDN.
+
+**Disable in production** to reduce attack surface:
+```zig
+.enable_playground = false, // default
+```
+
+### 10. Horizontal Scaling
 
 For high-traffic scenarios, run multiple `zgraphql` processes behind a load balancer:
 

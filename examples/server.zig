@@ -140,6 +140,7 @@ pub fn main() !void {
         .rate_limiter = &rate_limiter,
         .response_cache = &response_cache,
         .user_data = &user_ctx,
+        .enable_playground = true, // serves /graphql/playground
     });
 
     // Initialize Io backend.

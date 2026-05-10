@@ -210,7 +210,27 @@ var server = zg.GraphQLServer.init(allocator, &schema_def, .{
 
 默认通过 `X-Tenant-ID` 请求头解析租户。每个请求受租户配置的限制约束。如果没有匹配的租户且未设置默认租户，则使用全局服务器选项。
 
-### 9. 水平扩展
+### 9. Playground
+
+开发阶段启用内置的 GraphQL IDE：
+
+```zig
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .enable_playground = true,
+});
+```
+
+访问 `http://localhost:8080/graphql/playground`。
+
+- **离线模式**（默认）：零依赖的极简 Playground，支持查询编辑、变量输入、响应格式化和内省。
+- **CDN 模式**：将 `server.zig` 中的 HTML 替换为 `graphiql_html` 即可通过 CDN 提供 GraphiQL。
+
+**生产环境建议关闭**，以减少攻击面：
+```zig
+.enable_playground = false, // 默认值
+```
+
+### 10. 水平扩展
 
 高流量场景下，在负载均衡器后运行多个 `zgraphql` 进程：
 
