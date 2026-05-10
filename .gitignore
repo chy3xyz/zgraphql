@@ -4,3 +4,4 @@ zig-out/
 *.heapsnapshot
 *.trace.json
 *.trace.json.gz
+/check_*
