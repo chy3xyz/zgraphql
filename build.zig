@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "dataloader", .path = "examples/dataloader.zig" },
         .{ .name = "distributed-cache", .path = "examples/distributed_cache.zig" },
         .{ .name = "tenant", .path = "examples/tenant.zig" },
+        .{ .name = "database", .path = "examples/database.zig" },
         .{ .name = "benchmark", .path = "bench/benchmark.zig" },
     };
 
