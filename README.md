@@ -48,7 +48,7 @@ A **production-ready** GraphQL library for **Zig 0.16.0**, built with zero exter
 
 ## Requirements
 
-- **Zig 0.16.0** (uses `std.Io` API — pre-release, production deployment should wait for GA)
+- **Zig 0.16.0** (uses `std.Io` API, released 2026-04-13)
 
 ---
 
@@ -411,7 +411,7 @@ zig build run-stress-test
 
 ## Production Readiness
 
-**Score: 8.1 / 10**
+**Score: 8.3 / 10**
 
 | Area | Score | Notes |
 |------|-------|-------|
@@ -420,12 +420,11 @@ zig build run-stress-test
 | Documentation | 8/10 | Bilingual docs, architecture guide, API reference |
 | Performance | 8/10 | ~501 ops/sec sustained, lock-free metrics |
 | Features | 9/10 | Complete GraphQL spec coverage + production extras |
-| Maturity | 7/10 | Waiting for Zig 0.16.0 GA; no built-in distributed cache |
+| Maturity | 8/10 | No built-in distributed cache; no built-in tenant isolation |
 
 **Remaining gaps**:
-1. **Zig 0.16.0 not yet released** — production deployment should wait for GA.
-2. **No built-in distributed cache** — Redis integration needed for multi-node deployments.
-3. **No built-in tenant isolation** — multi-tenant workloads require custom resolver logic.
+1. **No built-in distributed cache** — Redis integration needed for multi-node deployments.
+2. **No built-in tenant isolation** — multi-tenant workloads require custom resolver logic.
 
 For deployment guidance, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
