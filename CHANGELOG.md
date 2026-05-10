@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Distributed tracing integration with OpenTelemetry-compatible span propagation
 - Auto-generated API documentation from introspection (`DocGenerator`)
 
+## [0.1.1] - 2026-05-10
+
+### Added
+- **Complex Example** (`examples/complex.zig`): Comprehensive real-world-style GraphQL API demonstrating the full zgraphql feature set in a single application:
+  - Multi-domain schema (e-commerce + social): Users, Posts, Comments, Products, Orders
+  - Nested field resolvers with DataLoader batch loading for N+1 prevention
+  - Role-based field authorization (`users` query requires admin role)
+  - Tenant isolation with per-tenant resource limits
+  - Distributed cache (L1 response cache + L2 in-memory backend)
+  - Rate limiting, metrics collection, and built-in GraphQL Playground
+  - Mutations for creating posts and orders
+  - Subscription schema with WebSocket support
+
 ## [0.1.0] - 2026-05-09
 
 ### Added
@@ -37,5 +50,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
-[Unreleased]: https://github.com/your-org/zgraphql/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/your-org/zgraphql/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chy3xyz/zgraphql/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.1.1
+[0.1.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.1.0
