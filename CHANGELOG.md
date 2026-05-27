@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-28
+
 ### Added
 - Full custom directive support: schema declaration, validation, and execution pipeline
 - Query Plan Cache for pre-validated execution plans
 - Distributed tracing integration with OpenTelemetry-compatible span propagation
 - Auto-generated API documentation from introspection (`DocGenerator`)
+
+### Changed
+- Migrated to Zig 0.17.0 (`std.Io` API)
 
 ## [0.1.1] - 2026-05-10
 
@@ -50,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
-[Unreleased]: https://github.com/chy3xyz/zgraphql/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.1.1
+[Unreleased]: https://github.com/chy3xyz/zgraphql/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.3.0
+[0.1.1]: https://github.com/chy3xyz/zgraphql/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.1.0
