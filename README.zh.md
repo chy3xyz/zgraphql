@@ -1,6 +1,6 @@
 # zgraphql
 
-一个可用于**生产环境**的 **Zig 0.16.0** GraphQL 库，**零外部依赖**。
+一个可用于**生产环境**的 **Zig 0.17.0** GraphQL 库，**零外部依赖**。
 
 ---
 
@@ -53,7 +53,7 @@
 
 ## 环境要求
 
-- **Zig 0.16.0**（使用 `std.Io` API，2026-04-13 正式发布）
+- **Zig 0.17.0**（使用 `std.Io` API）
 
 ---
 
@@ -224,7 +224,7 @@ const values = try dl.loadMany(&.{"1", "2", "3"});
 
 ### 异步设计
 
-zgraphql 为 Zig 0.16.0 的 `std.Io` 抽象而设计：
+zgraphql 为 Zig 0.17.0 的 `std.Io` 抽象而设计：
 
 - **Resolver** 是普通函数，返回 `Value`，在 `std.Io` 管理的纤程中运行。
 - **并行字段解析** 使用 `Io.Group` 实现结构化并发。

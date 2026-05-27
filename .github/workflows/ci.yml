@@ -18,7 +18,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Build
         run: zig build
@@ -40,7 +40,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run fuzz tests (5 minutes each)
         run: |
@@ -55,7 +55,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Run tests with leak detection
         run: zig test src/zgraphql.zig -OReleaseSafe

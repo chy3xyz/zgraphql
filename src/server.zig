@@ -12,7 +12,7 @@ const log = std.log.scoped(.zgraphql_server);
 const max_server_instances = 16;
 
 /// Registered server instances for graceful shutdown signal handling.
-var g_server_registry: [max_server_instances]?*GraphQLServer = .{null} ** max_server_instances;
+var g_server_registry: [max_server_instances]?*GraphQLServer = @splat(null);
 var g_registry_mutex: std.atomic.Mutex = .unlocked;
 
 fn registerServerForSignals(server: *GraphQLServer) void {
@@ -382,7 +382,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
                     const val_start = i + needle.len;
                     const val_end = std.mem.indexOf(u8, buf[val_start..], "\r\n") orelse break;
                     const proto = std.mem.trim(u8, buf[val_start .. val_start + val_end], " \t");
-                    if (std.ascii.indexOfIgnoreCase(proto, "graphql-transport-ws") != null) {
+                    if (std.ascii.findIgnoreCase(proto, "graphql-transport-ws") != null) {
                         ws_extra[0] = .{ .name = "sec-websocket-protocol", .value = "graphql-transport-ws" };
                         ws_extra_count = 1;
                     }

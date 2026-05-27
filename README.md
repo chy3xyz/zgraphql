@@ -1,6 +1,6 @@
 # zgraphql
 
-A **production-ready** GraphQL library for **Zig 0.16.0**, built with zero external dependencies.
+A **production-ready** GraphQL library for **Zig 0.17.0**, built with zero external dependencies.
 
 ---
 
@@ -53,7 +53,7 @@ A **production-ready** GraphQL library for **Zig 0.16.0**, built with zero exter
 
 ## Requirements
 
-- **Zig 0.16.0** (uses `std.Io` API, released 2026-04-13)
+- **Zig 0.17.0** (uses `std.Io` API)
 
 ---
 
@@ -224,7 +224,7 @@ const values = try dl.loadMany(&.{"1", "2", "3"});
 
 ### Async Design
 
-zgraphql is architected for Zig 0.16.0's `std.Io` abstraction:
+zgraphql is architected for Zig 0.17.0's `std.Io` abstraction:
 
 - **Resolvers** are plain functions that return `Value`. They run inside fibers managed by `std.Io`.
 - **Concurrent field resolution** uses `Io.Group` for structured concurrency.

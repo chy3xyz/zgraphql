@@ -37,7 +37,7 @@ GraphQL 查询字符串 / SDL
 - 单元测试在 `std.testing.allocator` 下运行，可自动检测泄漏。
 
 ### 并发模型
-为 Zig 0.16.0 的 `std.Io` 抽象而构建：
+为 Zig 0.17.0 的 `std.Io` 抽象而构建：
 - **Linux**：io_uring 后端实现真正的异步 I/O。
 - **macOS/Windows/BSD**：基于工作窃取线程池的 Threaded 后端。
 - Resolver 是在 `std.Io` 管理的纤程中运行的普通函数，无需显式的 `async/await` 语法。

@@ -37,7 +37,7 @@ All functionality is implemented using only the Zig standard library. This elimi
 - Unit tests run under `std.testing.allocator` which detects leaks automatically.
 
 ### Concurrency Model
-Built for Zig 0.16.0's `std.Io` abstraction:
+Built for Zig 0.17.0's `std.Io` abstraction:
 - **Linux**: io_uring backend for true async I/O.
 - **macOS/Windows/BSD**: Threaded backend using a work-stealing thread pool.
 - Resolvers are plain functions that run inside fibers managed by `std.Io`. No explicit `async/await` syntax is required.

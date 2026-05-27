@@ -63,6 +63,8 @@ fn generateRandomBytes(allocator: std.mem.Allocator, rng: *std.Random.DefaultPrn
 }
 
 fn generateEdgeCaseInput(allocator: std.mem.Allocator, rng: *std.Random.DefaultPrng) ![]u8 {
+    const quote_10k: [10000]u8 = @splat('"');
+    const dots_1k: [3000]u8 = @splat('.');
     const inputs = [_][]const u8{
         "",
         "{",
@@ -71,8 +73,8 @@ fn generateEdgeCaseInput(allocator: std.mem.Allocator, rng: *std.Random.DefaultP
         " query ",
         "query { }",
         "{ field { field { field { field { field } } } } }",
-        "\"" ** 10000,
-        "..." ** 1000,
+        &quote_10k,
+        &dots_1k,
         "{ a(b: { c: { d: { e: { f: 1 } } } }) }",
     };
     const idx = rng.random().int(usize) % inputs.len;

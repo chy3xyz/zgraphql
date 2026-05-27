@@ -1,4 +1,4 @@
-/// zgraphql - A GraphQL library for Zig 0.16.0
+/// zgraphql - A GraphQL library for Zig 0.17.0
 ///
 /// Features:
 /// - Full GraphQL query parsing (Lexer + Parser)
