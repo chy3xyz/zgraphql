@@ -26,10 +26,10 @@ pub fn TypeSafeSchemaBuilder(comptime Context: type, comptime def: anytype) type
     // Pre-generate all thunks at compile time.
     const thunk_entries = comptime blk: {
         var count: usize = 0;
-        for (@typeInfo(@TypeOf(def)).@"struct".fields) |type_field| {
-            const type_value = @field(def, type_field.name);
-            for (@typeInfo(@TypeOf(type_value)).@"struct".fields) |field_def| {
-                const field_value = @field(type_value, field_def.name);
+        for (@typeInfo(@TypeOf(def)).@"struct".field_names) |type_name| {
+            const type_value = @field(def, type_name);
+            for (@typeInfo(@TypeOf(type_value)).@"struct".field_names) |field_name| {
+                const field_value = @field(type_value, field_name);
                 if (@hasField(@TypeOf(field_value), "resolve")) count += 1;
                 if (@hasField(@TypeOf(field_value), "subscribe")) count += 1;
             }
@@ -37,16 +37,16 @@ pub fn TypeSafeSchemaBuilder(comptime Context: type, comptime def: anytype) type
 
         var entries: [count]ThunkEntry = undefined;
         var idx: usize = 0;
-        for (@typeInfo(@TypeOf(def)).@"struct".fields) |type_field| {
-            const type_value = @field(def, type_field.name);
-            for (@typeInfo(@TypeOf(type_value)).@"struct".fields) |field_def| {
-                const field_value = @field(type_value, field_def.name);
+        for (@typeInfo(@TypeOf(def)).@"struct".field_names) |type_name| {
+            const type_value = @field(def, type_name);
+            for (@typeInfo(@TypeOf(type_value)).@"struct".field_names) |field_name| {
+                const field_value = @field(type_value, field_name);
                 if (@hasField(@TypeOf(field_value), "resolve")) {
                     const resolver_fn = @field(field_value, "resolve");
                     const thunk = makeResolveThunk(Context, resolver_fn);
                     entries[idx] = .{
-                        .type_name = type_field.name,
-                        .field_name = field_def.name,
+                        .type_name = type_name,
+                        .field_name = field_name,
                         .kind = .resolve,
                         .ptr = thunk,
                     };
@@ -56,8 +56,8 @@ pub fn TypeSafeSchemaBuilder(comptime Context: type, comptime def: anytype) type
                     const subscribe_fn = @field(field_value, "subscribe");
                     const thunk = makeSubscribeThunk(Context, subscribe_fn);
                     entries[idx] = .{
-                        .type_name = type_field.name,
-                        .field_name = field_def.name,
+                        .type_name = type_name,
+                        .field_name = field_name,
                         .kind = .subscribe,
                         .ptr = thunk,
                     };
@@ -98,10 +98,10 @@ fn makeResolveThunk(comptime Context: type, comptime resolver: anytype) *const f
             const typed_ctx = if (Context == void) {} else @as(*Context, @ptrCast(@alignCast(ctx)));
 
             const ResolveInfo = @typeInfo(@TypeOf(resolver)).@"fn";
-            const has_args = ResolveInfo.params.len == 3;
+            const has_args = ResolveInfo.param_types.len == 3;
 
             if (has_args) {
-                const AT = ResolveInfo.params[2].type.?;
+                const AT = ResolveInfo.param_types[2].?;
                 if (AT != void) {
                     const args = try coerceArgs(allocator, raw_args, AT);
                     defer deinitArgs(allocator, args);
@@ -123,10 +123,10 @@ fn makeSubscribeThunk(comptime Context: type, comptime resolver: anytype) *const
             const typed_ctx = if (Context == void) {} else @as(*Context, @ptrCast(@alignCast(ctx)));
 
             const ResolveInfo = @typeInfo(@TypeOf(resolver)).@"fn";
-            const has_args = ResolveInfo.params.len == 3;
+            const has_args = ResolveInfo.param_types.len == 3;
 
             if (has_args) {
-                const AT = ResolveInfo.params[2].type.?;
+                const AT = ResolveInfo.param_types[2].?;
                 if (AT != void) {
                     const args = try coerceArgs(allocator, raw_args, AT);
                     defer deinitArgs(allocator, args);
@@ -141,18 +141,17 @@ fn makeSubscribeThunk(comptime Context: type, comptime resolver: anytype) *const
 
 fn coerceArgs(allocator: std.mem.Allocator, raw: std.StringHashMap(Value), comptime Args: type) !Args {
     var result: Args = undefined;
-    inline for (@typeInfo(Args).@"struct".fields) |field| {
-        const key = field.name;
+    inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |key, FieldType| {
         const val = raw.get(key) orelse return error.ResolverError;
-        @field(result, key) = try coerceValue(allocator, val, field.type);
+        @field(result, key) = try coerceValue(allocator, val, FieldType);
     }
     return result;
 }
 
 fn deinitArgs(allocator: std.mem.Allocator, args: anytype) void {
     const T = @TypeOf(args);
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        deinitValue(allocator, @field(args, field.name), field.type);
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
+        deinitValue(allocator, @field(args, name), FieldType);
     }
 }
 
@@ -172,8 +171,8 @@ fn deinitValue(allocator: std.mem.Allocator, val: anytype, comptime T: type) voi
             }
         },
         .@"struct" => {
-            inline for (@typeInfo(T).@"struct".fields) |field| {
-                deinitValue(allocator, @field(val, field.name), field.type);
+            inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
+                deinitValue(allocator, @field(val, name), FieldType);
             }
         },
         else => {},
@@ -207,9 +206,9 @@ fn coerceValue(allocator: std.mem.Allocator, val: Value, comptime T: type) !T {
         .@"struct" => {
             if (val.data != .object) return error.ResolverError;
             var result: T = undefined;
-            inline for (@typeInfo(T).@"struct".fields) |field| {
-                const field_val = val.data.object.get(field.name) orelse return error.ResolverError;
-                @field(result, field.name) = try coerceValue(allocator, field_val, field.type);
+            inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FieldType| {
+                const field_val = val.data.object.get(name) orelse return error.ResolverError;
+                @field(result, name) = try coerceValue(allocator, field_val, FieldType);
             }
             return result;
         },
@@ -244,9 +243,9 @@ fn serializeValue(allocator: std.mem.Allocator, val: anytype) !Value {
         .@"struct" => {
             var obj = Value.initObject(allocator);
             errdefer obj.deinit();
-            inline for (@typeInfo(T).@"struct".fields) |field| {
-                const field_val = try serializeValue(allocator, @field(val, field.name));
-                try obj.data.object.put(try allocator.dupe(u8, field.name), field_val);
+            inline for (@typeInfo(T).@"struct".field_names) |name| {
+                const field_val = try serializeValue(allocator, @field(val, name));
+                try obj.data.object.put(try allocator.dupe(u8, name), field_val);
             }
             return obj;
         },

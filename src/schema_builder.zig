@@ -48,29 +48,27 @@ fn validateDef(comptime Def: type) void {
         @compileError("SchemaBuilder expects a struct literal, got " ++ @typeName(Def));
     }
 
-    inline for (info.@"struct".fields) |type_field| {
-        const TypeDef = type_field.type;
+    inline for (info.@"struct".field_names, info.@"struct".field_types) |type_name, TypeDef| {
         const type_info = @typeInfo(TypeDef);
         if (type_info != .@"struct") {
-            @compileError("SchemaBuilder type '" ++ type_field.name ++ "' must be a struct of fields");
+            @compileError("SchemaBuilder type '" ++ type_name ++ "' must be a struct of fields");
         }
 
         // Skip validation for types with explicit kind (scalar, enum, union etc.) and auto-enums
         if (comptime isAutoEnum(TypeDef) or hasExplicitKind(TypeDef)) continue;
 
         // Object/interface/input: each field (except meta) must have .type
-        inline for (type_info.@"struct".fields) |field_def| {
-            if (std.mem.eql(u8, field_def.name, "kind") or std.mem.eql(u8, field_def.name, "implements")) continue;
+        inline for (type_info.@"struct".field_names, type_info.@"struct".field_types) |field_name, FieldType| {
+            if (std.mem.eql(u8, field_name, "kind") or std.mem.eql(u8, field_name, "implements")) continue;
 
-            const FieldType = field_def.type;
             const field_info = @typeInfo(FieldType);
             if (field_info != .@"struct") {
-                @compileError("SchemaBuilder field '" ++ type_field.name ++ "." ++ field_def.name ++ "' must be a struct with at least .type");
+                @compileError("SchemaBuilder field '" ++ type_name ++ "." ++ field_name ++ "' must be a struct with at least .type");
             }
             const has_type = blk: {
                 var found = false;
-                for (field_info.@"struct".fields) |f| {
-                    if (std.mem.eql(u8, f.name, "type")) {
+                for (field_info.@"struct".field_names) |f_name| {
+                    if (std.mem.eql(u8, f_name, "type")) {
                         found = true;
                         break;
                     }
@@ -78,7 +76,7 @@ fn validateDef(comptime Def: type) void {
                 break :blk found;
             };
             if (!has_type) {
-                @compileError("SchemaBuilder field '" ++ type_field.name ++ "." ++ field_def.name ++ "' is missing required .type");
+                @compileError("SchemaBuilder field '" ++ type_name ++ "." ++ field_name ++ "' is missing required .type");
             }
         }
     }
@@ -88,8 +86,8 @@ fn validateDef(comptime Def: type) void {
 fn hasExplicitKind(comptime TypeDef: type) bool {
     const type_info = @typeInfo(TypeDef);
     if (type_info != .@"struct") return false;
-    inline for (type_info.@"struct".fields) |f| {
-        if (std.mem.eql(u8, f.name, "kind")) return true;
+    inline for (type_info.@"struct".field_names) |f_name| {
+        if (std.mem.eql(u8, f_name, "kind")) return true;
     }
     return false;
 }
@@ -97,16 +95,15 @@ fn hasExplicitKind(comptime TypeDef: type) bool {
 /// Detect whether the type definition is an enum (all fields lack .type, and no explicit .kind).
 fn isAutoEnum(comptime TypeDef: type) bool {
     const type_info = @typeInfo(TypeDef);
-    if (type_info != .@"struct" or type_info.@"struct".fields.len == 0) return false;
+    if (type_info != .@"struct" or type_info.@"struct".field_names.len == 0) return false;
     if (hasExplicitKind(TypeDef)) return false;
 
     var all_enum = true;
-    inline for (type_info.@"struct".fields) |field_def| {
-        const FieldType = field_def.type;
+    inline for (type_info.@"struct".field_types) |FieldType| {
         const field_info = @typeInfo(FieldType);
         if (field_info == .@"struct") {
-            inline for (field_info.@"struct".fields) |f| {
-                if (std.mem.eql(u8, f.name, "type")) {
+            inline for (field_info.@"struct".field_names) |f_name| {
+                if (std.mem.eql(u8, f_name, "type")) {
                     all_enum = false;
                 }
             }
@@ -130,8 +127,8 @@ fn resolveKind(comptime type_value: anytype) []const u8 {
 /// Extract .implements value from type definition, or empty string.
 fn getImplements(comptime TypeDef: type, comptime type_value: anytype) []const u8 {
     const type_info = @typeInfo(TypeDef);
-    inline for (type_info.@"struct".fields) |f| {
-        if (std.mem.eql(u8, f.name, "implements")) {
+    inline for (type_info.@"struct".field_names) |f_name| {
+        if (std.mem.eql(u8, f_name, "implements")) {
             return @field(type_value, "implements");
         }
     }
@@ -145,12 +142,11 @@ fn generateSDL(comptime def: anytype) []const u8 {
     const Def = @TypeOf(def);
     const info = @typeInfo(Def);
     var has_query = false;
-    inline for (info.@"struct".fields) |type_field| {
-        if (std.mem.eql(u8, type_field.name, "Query")) has_query = true;
+    inline for (info.@"struct".field_names) |type_name| {
+        if (std.mem.eql(u8, type_name, "Query")) has_query = true;
     }
 
-    inline for (info.@"struct".fields) |type_field| {
-        const type_name = type_field.name;
+    inline for (info.@"struct".field_names) |type_name| {
         const type_value = @field(def, type_name);
         const TypeDef = @TypeOf(type_value);
         const type_info = @typeInfo(TypeDef);
@@ -164,8 +160,8 @@ fn generateSDL(comptime def: anytype) []const u8 {
 
         if (std.mem.eql(u8, kind, "union")) {
             var members_str: []const u8 = "";
-            inline for (type_info.@"struct".fields) |f| {
-                if (std.mem.eql(u8, f.name, "members")) {
+            inline for (type_info.@"struct".field_names) |f_name| {
+                if (std.mem.eql(u8, f_name, "members")) {
                     members_str = @field(type_value, "members");
                 }
             }
@@ -175,16 +171,15 @@ fn generateSDL(comptime def: anytype) []const u8 {
 
         if (std.mem.eql(u8, kind, "enum")) {
             result = result ++ "enum " ++ type_name ++ " {\n";
-            inline for (type_info.@"struct".fields) |field_def| {
-                const field_name = field_def.name;
+            inline for (type_info.@"struct".field_names) |field_name| {
                 if (std.mem.eql(u8, field_name, "kind")) continue;
                 const field_value = @field(type_value, field_name);
                 var description: []const u8 = "";
                 const FieldType = @TypeOf(field_value);
                 const field_info = @typeInfo(FieldType);
                 if (field_info == .@"struct") {
-                    inline for (field_info.@"struct".fields) |f| {
-                        if (std.mem.eql(u8, f.name, "description")) {
+                    inline for (field_info.@"struct".field_names) |f_name| {
+                        if (std.mem.eql(u8, f_name, "description")) {
                             description = @field(field_value, "description");
                         }
                     }
@@ -205,8 +200,7 @@ fn generateSDL(comptime def: anytype) []const u8 {
         }
         result = result ++ " {\n";
 
-        inline for (type_info.@"struct".fields) |field_def| {
-            const field_name = field_def.name;
+        inline for (type_info.@"struct".field_names) |field_name| {
             // Skip meta-fields
             if (std.mem.eql(u8, field_name, "kind") or std.mem.eql(u8, field_name, "implements")) continue;
             const field_value = @field(type_value, field_name);
@@ -216,14 +210,14 @@ fn generateSDL(comptime def: anytype) []const u8 {
             var description: []const u8 = "";
             const FieldType = @TypeOf(field_value);
             const field_info = @typeInfo(FieldType);
-            inline for (field_info.@"struct".fields) |f| {
-                if (std.mem.eql(u8, f.name, "type")) {
+            inline for (field_info.@"struct".field_names) |f_name| {
+                if (std.mem.eql(u8, f_name, "type")) {
                     type_str = @field(field_value, "type");
                 }
-                if (std.mem.eql(u8, f.name, "args")) {
+                if (std.mem.eql(u8, f_name, "args")) {
                     args_str = generateArgsSDL(@field(field_value, "args"));
                 }
-                if (std.mem.eql(u8, f.name, "description")) {
+                if (std.mem.eql(u8, f_name, "description")) {
                     description = @field(field_value, "description");
                 }
             }
@@ -240,9 +234,9 @@ fn generateSDL(comptime def: anytype) []const u8 {
     // Add schema definition if Query type exists
     var has_mutation = false;
     var has_subscription = false;
-    inline for (info.@"struct".fields) |type_field| {
-        if (std.mem.eql(u8, type_field.name, "Mutation")) has_mutation = true;
-        if (std.mem.eql(u8, type_field.name, "Subscription")) has_subscription = true;
+    inline for (info.@"struct".field_names) |type_name| {
+        if (std.mem.eql(u8, type_name, "Mutation")) has_mutation = true;
+        if (std.mem.eql(u8, type_name, "Subscription")) has_subscription = true;
     }
 
     if (has_query or has_mutation or has_subscription) {
@@ -262,18 +256,17 @@ fn generateArgsSDL(comptime args: anytype) []const u8 {
     const Args = @TypeOf(args);
     const info = @typeInfo(Args);
     var first = true;
-    inline for (info.@"struct".fields) |arg_field| {
+    inline for (info.@"struct".field_names) |arg_name| {
         if (!first) result = result ++ ", ";
         first = false;
 
-        const arg_name = arg_field.name;
         const arg_value = @field(args, arg_name);
 
         var arg_type_str: []const u8 = "";
         const ArgType = @TypeOf(arg_value);
         const arg_info = @typeInfo(ArgType);
-        inline for (arg_info.@"struct".fields) |f| {
-            if (std.mem.eql(u8, f.name, "type")) {
+        inline for (arg_info.@"struct".field_names) |f_name| {
+            if (std.mem.eql(u8, f_name, "type")) {
                 arg_type_str = @field(arg_value, "type");
             }
         }
