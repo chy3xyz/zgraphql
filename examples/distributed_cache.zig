@@ -45,7 +45,7 @@ pub fn main() !void {
     var dc = zg.DistributedCache.init(
         allocator,
         l2_backend.cacheBackend(),
-        try allocator.dupe(u8, "zgraphql:"),
+        "zgraphql:",
         &l1_cache,
     );
     defer dc.deinit();

@@ -259,6 +259,19 @@ const Database = struct {
         return self.orders.get(id);
     }
 
+    /// Returns the order with the smallest id greater than `after_id`, or null.
+    fn getLatestOrderAbove(self: *Database, after_id: i64) ?OrderRecord {
+        var best: ?OrderRecord = null;
+        var iter = self.orders.iterator();
+        while (iter.next()) |e| {
+            if (e.key_ptr.* <= after_id) continue;
+            if (best == null or e.key_ptr.* < best.?.id) {
+                best = e.value_ptr.*;
+            }
+        }
+        return best;
+    }
+
     fn getComment(self: *Database, id: i64) ?CommentRecord {
         return self.comments.get(id);
     }
@@ -716,35 +729,25 @@ pub fn main() !void {
             .productId = .{ .type = "ID!" },
             .quantity = .{ .type = "Int!" },
         },
-        .Role = .{},
-        .OrderStatus = .{},
+        .Role = .{
+            .kind = "enum",
+            .USER = .{},
+            .ADMIN = .{},
+        },
+        .OrderStatus = .{
+            .kind = "enum",
+            .PENDING = .{},
+            .CONFIRMED = .{},
+            .SHIPPED = .{},
+            .DELIVERED = .{},
+        },
     });
 
     var schema_def = try Builder.init(allocator);
     defer schema_def.deinit();
 
-    // SchemaBuilder generates empty object types for enums; manually replace them
-    {
-        var role_enum = zg.schema.EnumType.init(allocator);
-        try role_enum.values.put(try allocator.dupe(u8, "USER"), .{ .name = "USER" });
-        try role_enum.values.put(try allocator.dupe(u8, "ADMIN"), .{ .name = "ADMIN" });
-        const role_type = try allocator.create(zg.schema.Type);
-        role_type.* = .{ .name = "Role", .kind = .{ .enum_type = role_enum } };
-        try schema_def.registerType("Role", role_type);
-
-        var status_enum = zg.schema.EnumType.init(allocator);
-        try status_enum.values.put(try allocator.dupe(u8, "PENDING"), .{ .name = "PENDING" });
-        try status_enum.values.put(try allocator.dupe(u8, "CONFIRMED"), .{ .name = "CONFIRMED" });
-        try status_enum.values.put(try allocator.dupe(u8, "SHIPPED"), .{ .name = "SHIPPED" });
-        try status_enum.values.put(try allocator.dupe(u8, "DELIVERED"), .{ .name = "DELIVERED" });
-        const status_type = try allocator.create(zg.schema.Type);
-        status_type.* = .{ .name = "OrderStatus", .kind = .{ .enum_type = status_enum } };
-        try schema_def.registerType("OrderStatus", status_type);
-    }
-
-    // Wire Mutation and Subscription root types (SchemaBuilder only emits query root)
-    schema_def.mutation_type = schema_def.getType("Mutation");
-    schema_def.subscription_type = schema_def.getType("Subscription");
+    // SchemaBuilder already emits mutation/subscription root types in the SDL,
+    // so no manual wiring is needed here.
 
     // Query resolvers
     if (schema_def.query_type.kind.object.fields.getPtr("me")) |f| f.resolve = meResolver;
@@ -763,6 +766,46 @@ pub fn main() !void {
     if (schema_def.mutation_type) |mt| {
         if (mt.kind.object.fields.getPtr("createPost")) |f| f.resolve = createPostResolver;
         if (mt.kind.object.fields.getPtr("createOrder")) |f| f.resolve = createOrderResolver;
+    }
+
+    // Subscription resolver: pushes a new order event when one is created.
+    if (schema_def.subscription_type) |st| {
+        if (st.kind.object.fields.getPtr("newOrder")) |f| {
+            f.subscribe = struct {
+                const OrderStream = struct {
+                    app: *AppContext,
+                    // Polls the DB for new orders on each next() call.
+                    last_id: i64 = 0,
+
+                    fn next(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!?zg.Value {
+                        const self = @as(*OrderStream, @ptrCast(@alignCast(ptr)));
+                        if (self.app.db.getLatestOrderAbove(self.last_id)) |o| {
+                            self.last_id = o.id;
+                            return try orderToValue(alloc, o, self.app);
+                        }
+                        return null;
+                    }
+
+                    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                        const self = @as(*OrderStream, @ptrCast(@alignCast(ptr)));
+                        alloc.destroy(self);
+                    }
+                };
+
+                fn subscribe(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.schema.SubscriptionStream {
+                    const app = @as(*AppContext, @ptrCast(@alignCast(ctx.?)));
+                    const stream = try alloc.create(OrderStream);
+                    stream.* = .{ .app = app };
+                    return zg.schema.SubscriptionStream{
+                        .ptr = stream,
+                        .vtable = &.{
+                            .next = OrderStream.next,
+                            .deinit = OrderStream.deinit,
+                        },
+                    };
+                }
+            }.subscribe;
+        }
     }
 
     // Nested field resolvers

@@ -146,11 +146,10 @@ kill -TERM $(pidof my-zgraphql-app)
 
 ### 6. Multi-Tenant Considerations
 
-zgraphql does not provide built-in tenant isolation. For multi-tenant deployments:
+zgraphql provides built-in tenant isolation via `TenantManager` (see Section 8 below). Each tenant can have its own schema override, query depth/complexity limits, body size limit, rate limiter, and query whitelist. For additional isolation:
 
 - **Option A**: Run one `zgraphql` instance per tenant, routed by a gateway.
 - **Option B**: Use a single instance with resolver-level tenant filtering via `ExecutionContext.user_data`.
-- **Option C**: Shard by schema; load different `Schema` objects per request using a routing layer.
 
 ### 7. Distributed Cache (Multi-Node)
 

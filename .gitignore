@@ -5,3 +5,7 @@ zig-out/
 *.trace.json
 *.trace.json.gz
 /check_*
+
+# Local tooling / review artifacts (not project files)
+REVIEW.md
+reasonix.toml

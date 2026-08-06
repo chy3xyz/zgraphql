@@ -104,6 +104,50 @@ pub fn main() !void {
 }
 ```
 
+### Type-Safe Schema DSL
+
+For resolvers written with plain Zig types (instead of the manual `Value` plumbing above), use `TypeSafeSchemaBuilder`. It binds resolvers into the schema at compile time with zero runtime overhead:
+
+```zig
+const AppContext = struct {
+    greeting: []const u8,
+    scale: i64,
+};
+
+const Builder = zg.TypeSafeSchemaBuilder(AppContext, .{
+    .Query = .{
+        .hello = .{
+            .type = "String!",
+            .resolve = struct {
+                fn resolve(ctx: *AppContext, alloc: std.mem.Allocator) anyerror![]const u8 {
+                    return try alloc.dupe(u8, ctx.greeting);
+                }
+            }.resolve,
+        },
+        .double = .{
+            .type = "Int!",
+            .args = .{ .value = .{ .type = "Int!" } },
+            .resolve = struct {
+                const Args = struct { value: i64 };
+                fn resolve(ctx: *AppContext, _: std.mem.Allocator, args: Args) anyerror!i64 {
+                    return args.value * ctx.scale;
+                }
+            }.resolve,
+        },
+    },
+});
+
+var schema_def = try Builder.init(allocator); // parses SDL + binds all resolvers
+defer schema_def.deinit();
+```
+
+Resolver signatures:
+- No args: `fn(ctx: *Context, allocator) anyerror!ReturnType`
+- With args: `fn(ctx: *Context, allocator, args: ArgsStruct) anyerror!ReturnType`
+- Use `void` as the context type when no context is needed.
+
+Supported return types: strings, ints, floats, booleans, optionals, arrays, and structs. Unsupported types are rejected at compile time with `@compileError`. See [`examples/typesafe.zig`](examples/typesafe.zig) for a complete runnable example.
+
 ### Run HTTP Server
 
 ```zig
@@ -405,11 +449,10 @@ try tm.register(.{
 
 var server = zg.GraphQLServer.init(allocator, &schema_def, .{
     .tenant_manager = &tm,
-    .tenant_header = "X-Tenant-ID",
 });
 ```
 
-Tenants are resolved from the request header (default: `X-Tenant-ID`). Each tenant can have its own:
+Tenants are resolved from the request header (default: `X-Tenant-ID`). To use a custom header, call `tm.setHeaderName("X-Custom-Tenant")` before starting the server. Each tenant can have its own:
 - Schema override
 - Query depth / complexity limits
 - Body size limit
@@ -493,29 +536,31 @@ zig build run-stress-test
 **Current test status**:
 | Suite | Status |
 |-------|--------|
-| Unit tests | 84/84 passing |
+| Unit tests | 115/115 passing |
 | Integration tests | 4/4 passing |
 | Parser fuzz | 10,000 iters, 0 leaks |
 | JSON fuzz | 5,000 iters, 0 leaks |
-| Stress test | ~501 ops/sec, stable |
+| Stress test | stable under sustained load |
 
 ---
 
 ## Production Readiness
 
-**Score: 9.0 / 10**
+**Score: 8.5 / 10**
 
 | Area | Score | Notes |
 |------|-------|-------|
-| Testing | 9/10 | Unit, integration, fuzz, stress tests all passing |
-| Safety | 9/10 | Integer rate limiting, CORS fixes, signal registry, leak-free |
-| Documentation | 9/10 | Bilingual docs, architecture guide, API reference |
-| Performance | 8/10 | ~501 ops/sec sustained, lock-free metrics, L1+L2 caching |
-| Features | 10/10 | Complete GraphQL spec + distributed cache + tenant isolation + playground |
-| Maturity | 9/10 | Built-in distributed cache and tenant isolation |
+| Testing | 8/10 | Unit, integration, fuzz, stress tests all passing; OOM-path and HTTP-layer coverage still growing |
+| Safety | 8/10 | Thread-safe query cache, leak-tested allocators, graceful shutdown |
+| Documentation | 8/10 | Bilingual docs, architecture guide, API reference |
+| Performance | 7/10 | Async std.Io execution, L1+L2 caching, lock-free metrics |
+| Features | 9/10 | Complete GraphQL spec + distributed cache + tenant isolation + playground |
+| Maturity | 8/10 | Built-in distributed cache and tenant isolation |
 
 **Remaining gaps**:
 1. **No built-in Redis protocol** — HTTP cache backend is provided; native Redis RESP requires a custom `CacheBackend` implementation.
+2. **OOM-injection tests** — `errdefer` cleanup paths are not yet exercised under simulated allocation failure.
+3. **HTTP-layer tests** — server request handling, WebSocket upgrade, and CORS paths lack direct unit tests.
 
 For deployment guidance, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 

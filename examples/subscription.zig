@@ -7,17 +7,6 @@
 const std = @import("std");
 const zg = @import("zgraphql");
 
-/// Simulates a real-time data source (e.g., a message broker, event bus, or
-/// database change stream). In production, this could be a Kafka consumer or
-/// an in-memory channel.
-const EventBus = struct {
-    var counter: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
-
-    fn nextValue() i64 {
-        return counter.fetchAdd(1, .seq_cst);
-    }
-};
-
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -45,16 +34,41 @@ pub fn main() !void {
     }
 
     // Subscription resolver: returns a stream of values.
-    // In zgraphql, subscription resolvers are registered similarly to field
-    // resolvers, but the executor treats them as streaming sources.
+    // In zgraphql, subscription fields must bind `subscribe` (not `resolve`)
+    // to a function that returns a `schema.SubscriptionStream`.
     if (schema_def.subscription_type) |sub_type| {
         if (sub_type.kind.object.fields.getPtr("counter")) |field| {
-            field.resolve = struct {
-                fn resolve(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
-                    _ = ctx;
-                    return zg.Value.fromInt(alloc, EventBus.nextValue());
+            field.subscribe = struct {
+                const StreamCtx = struct {
+                    current: i64 = 0,
+                    max: i64 = 5,
+
+                    fn next(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!?zg.Value {
+                        const ctx = @as(*StreamCtx, @ptrCast(@alignCast(ptr)));
+                        if (ctx.current >= ctx.max) return null;
+                        const v = ctx.current;
+                        ctx.current += 1;
+                        return zg.Value.fromInt(alloc, v);
+                    }
+
+                    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                        const ctx = @as(*StreamCtx, @ptrCast(@alignCast(ptr)));
+                        alloc.destroy(ctx);
+                    }
+                };
+
+                fn subscribe(_: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.schema.SubscriptionStream {
+                    const ctx = try alloc.create(StreamCtx);
+                    ctx.* = .{};
+                    return zg.schema.SubscriptionStream{
+                        .ptr = ctx,
+                        .vtable = &.{
+                            .next = StreamCtx.next,
+                            .deinit = StreamCtx.deinit,
+                        },
+                    };
                 }
-            }.resolve;
+            }.subscribe;
         }
     }
 

@@ -146,11 +146,10 @@ kill -TERM $(pidof my-zgraphql-app)
 
 ### 6. 多租户考量
 
-zgraphql 不提供内置的租户隔离。多租户部署方案：
+zgraphql 通过 `TenantManager` 提供内置租户隔离（见下方第 8 节）。每个租户可拥有独立的 schema 覆盖、查询深度/复杂度限制、请求体大小限制、限流器和查询白名单。如需更强的隔离：
 
 - **方案 A**：为每个租户运行独立的 `zgraphql` 实例，通过网关路由。
 - **方案 B**：单一实例，通过 `ExecutionContext.user_data` 在 resolver 级别进行租户过滤。
-- **方案 C**：按 schema 分片；通过路由层为每个请求加载不同的 `Schema` 对象。
 
 ### 7. 分布式缓存（多节点）
 

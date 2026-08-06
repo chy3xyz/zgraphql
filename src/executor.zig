@@ -26,6 +26,9 @@ pub const GraphQLError = struct {
     /// Path from the response root to the field that produced the error.
     /// Each element is a field name or list index.
     path: ?[]const []const u8 = null,
+    /// Source location (line/column) of the field that produced the error.
+    line: ?usize = null,
+    col: ?usize = null,
 
     pub fn deinit(self: *GraphQLError, allocator: std.mem.Allocator) void {
         allocator.free(self.message);
@@ -201,12 +204,47 @@ pub const Executor = struct {
 
         const op = op_def orelse return error.ResolverError;
 
-        // Fill in default values for variables not provided by the client
+        // Fill in default values for variables not provided by the client.
+        // Track which keys we inject so they can be cleaned up on exit,
+        // preventing cross-request state leakage when the Executor is reused.
+        var injected_defaults = std.StringHashMap(void).init(self.allocator);
+        defer {
+            // NOTE: injected_defaults holds shallow copies of the same keys
+            // stored in context.variables, so ownership of each key is
+            // released exactly once here, via fetchRemove.
+            var iter = injected_defaults.keyIterator();
+            while (iter.next()) |k| {
+                if (self.context.variables.fetchRemove(k.*)) |removed| {
+                    self.allocator.free(removed.key);
+                    var val = removed.value;
+                    val.deinit();
+                }
+            }
+            injected_defaults.deinit();
+        }
         for (op.variable_definitions.items) |*vd| {
             if (!self.context.variables.contains(vd.name)) {
                 if (vd.default_value) |*dv| {
+                    const var_key = try self.allocator.dupe(u8, vd.name);
+                    var key_owned = true;
+                    errdefer if (key_owned) self.allocator.free(var_key);
                     const default_val = try self.coerceValue(dv.*);
-                    try self.context.variables.put(try self.allocator.dupe(u8, vd.name), default_val);
+                    errdefer if (key_owned) {
+                        var val = default_val;
+                        val.deinit();
+                    };
+                    try self.context.variables.put(var_key, default_val);
+                    // var_key ownership now transferred to context.variables.
+                    key_owned = false;
+                    injected_defaults.put(var_key, {}) catch |e| {
+                        // Roll back the injected variable so nothing leaks.
+                        if (self.context.variables.fetchRemove(var_key)) |removed| {
+                            self.allocator.free(removed.key);
+                            var val = removed.value;
+                            val.deinit();
+                        }
+                        return e;
+                    };
                 }
             }
         }
@@ -241,6 +279,16 @@ pub const Executor = struct {
                         try path_list.data.list.append(Value.fromString(self.allocator, try self.allocator.dupe(u8, segment)));
                     }
                     try err_obj.data.object.put(try self.allocator.dupe(u8, "path"), path_list);
+                }
+                if (err.line != null and err.col != null) {
+                    var loc_list = Value.initList(self.allocator);
+                    errdefer loc_list.deinit();
+                    var loc = Value.initObject(self.allocator);
+                    errdefer loc.deinit();
+                    try loc.data.object.put(try self.allocator.dupe(u8, "line"), Value.fromInt(self.allocator, @intCast(err.line.?)));
+                    try loc.data.object.put(try self.allocator.dupe(u8, "column"), Value.fromInt(self.allocator, @intCast(err.col.?)));
+                    try loc_list.data.list.append(loc);
+                    try err_obj.data.object.put(try self.allocator.dupe(u8, "locations"), loc_list);
                 }
                 try errors_list.data.list.append(err_obj);
             }
@@ -479,19 +527,7 @@ pub const Executor = struct {
         // If only one field, execute sequentially
         if (field_ptrs.items.len <= 1) {
             for (field_ptrs.items, 0..) |field, i| {
-                const field_path = try self.dupePath(path_prefix, keys.items[i]);
-                defer self.freePath(field_path);
-                const field_value = self.executeFieldWithPath(field, parent_type, parent_value, field_path) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => |e| blk: {
-                        try self.recordError(e, keys.items[i], field_path);
-                        const fd = parent_type.getField(field.name);
-                        if (fd != null and fd.?.field_type.isNonNull()) {
-                            return e; // bubble up for NonNull fields
-                        }
-                        break :blk Value.fromNull(self.allocator);
-                    },
-                };
+                const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
                 try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
             }
             return result;
@@ -513,19 +549,7 @@ pub const Executor = struct {
         futures.ensureTotalCapacity(field_ptrs.items.len) catch {
             // Fallback: sequential execution for all fields
             for (field_ptrs.items, 0..) |field, i| {
-                const field_path = try self.dupePath(path_prefix, keys.items[i]);
-                defer self.freePath(field_path);
-                const field_value = self.executeFieldWithPath(field, parent_type, parent_value, field_path) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => |e| blk: {
-                        try self.recordError(e, keys.items[i], field_path);
-                        const fd = parent_type.getField(field.name);
-                        if (fd != null and fd.?.field_type.isNonNull()) {
-                            return e;
-                        }
-                        break :blk Value.fromNull(self.allocator);
-                    },
-                };
+                const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
                 try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
             }
             return result;
@@ -549,7 +573,7 @@ pub const Executor = struct {
                     error.Canceled => blk: {
                         const field_path = try self.dupePath(path_prefix, keys.items[i]);
                         defer self.freePath(field_path);
-                        try self.recordError(error.ResolverError, keys.items[i], field_path);
+                        try self.recordError(error.ResolverError, keys.items[i], field_path, null);
                         const fd = parent_type.getField(field_ptrs.items[i].name);
                         if (fd != null and fd.?.field_type.isNonNull()) {
                             return error.ResolverError;
@@ -560,7 +584,7 @@ pub const Executor = struct {
                     else => |e| blk: {
                         const field_path = try self.dupePath(path_prefix, keys.items[i]);
                         defer self.freePath(field_path);
-                        try self.recordError(e, keys.items[i], field_path);
+                        try self.recordError(e, keys.items[i], field_path, null);
                         const fd = parent_type.getField(field_ptrs.items[i].name);
                         if (fd != null and fd.?.field_type.isNonNull()) {
                             return e;
@@ -581,23 +605,29 @@ pub const Executor = struct {
         futures.clearRetainingCapacity();
 
         for (field_ptrs.items, 0..) |field, i| {
-            const field_path = try self.dupePath(path_prefix, keys.items[i]);
-            defer self.freePath(field_path);
-            const field_value = self.executeFieldWithPath(field, parent_type, parent_value, field_path) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => |e| blk: {
-                    try self.recordError(e, keys.items[i], field_path);
-                    const fd = parent_type.getField(field.name);
-                    if (fd != null and fd.?.field_type.isNonNull()) {
-                        return e;
-                    }
-                    break :blk Value.fromNull(self.allocator);
-                },
-            };
+            const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
             try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
         }
 
         return result;
+    }
+
+    /// Execute a single field sequentially, recording errors and bubbling up
+    /// NonNull field failures. Shared by all sequential execution paths.
+    fn executeOneFieldSequential(self: *Executor, field: *ast.Field, parent_type: *schema.Type, parent_value: Value, path_prefix: []const []const u8, field_key: []const u8) ExecutionError!Value {
+        const field_path = try self.dupePath(path_prefix, field_key);
+        defer self.freePath(field_path);
+        return self.executeFieldWithPath(field, parent_type, parent_value, field_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => |e| blk: {
+                try self.recordError(e, field_key, field_path, .{ .line = field.line, .col = field.col });
+                const fd = parent_type.getField(field.name);
+                if (fd != null and fd.?.field_type.isNonNull()) {
+                    return e; // bubble up for NonNull fields
+                }
+                break :blk Value.fromNull(self.allocator);
+            },
+        };
     }
 
     fn executeSubSelection(self: *Executor, ss: *ast.SelectionSet, field_def: schema.Field, parent_value: Value, path: []const []const u8) ExecutionError!Value {
@@ -627,7 +657,7 @@ pub const Executor = struct {
                     const item_result = self.executeSelectionSetWithPath(ss, field_type.?, item.*, path) catch |err| switch (err) {
                         error.OutOfMemory => return err,
                         else => |e| blk: {
-                            try self.recordError(e, field_def.name, path);
+                            try self.recordError(e, field_def.name, path, null);
                             if (elem_non_null) {
                                 results.deinit();
                                 // If outer type is also non-null, bubble further
@@ -652,7 +682,7 @@ pub const Executor = struct {
         return executor.executeFieldWithPath(field, parent_type, parent_value, path);
     }
 
-    fn recordError(self: *Executor, err: anyerror, field_name: []const u8, path: []const []const u8) std.mem.Allocator.Error!void {
+    fn recordError(self: *Executor, err: anyerror, field_name: []const u8, path: []const []const u8, location: ?struct { line: usize, col: usize }) std.mem.Allocator.Error!void {
         const msg = try std.fmt.allocPrint(self.allocator, "Error in field '{s}': {s}", .{ field_name, @errorName(err) });
         errdefer self.allocator.free(msg);
 
@@ -666,7 +696,12 @@ pub const Executor = struct {
             path_copy = segments;
         }
 
-        try self.errors.append(.{ .message = msg, .path = path_copy });
+        try self.errors.append(.{
+            .message = msg,
+            .path = path_copy,
+            .line = if (location) |loc| loc.line else null,
+            .col = if (location) |loc| loc.col else null,
+        });
         if (self.hooks.on_error) |hook| {
             hook(self.context.user_data, msg);
         }
@@ -1836,3 +1871,147 @@ test "executor __typename from runtime value" {
     try std.testing.expectEqualStrings("User", node.get("__typename").?.data.string);
 }
 
+
+test "executor mutation end-to-end" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
+
+    const mutation_type = try allocator.create(schema.Type);
+    mutation_type.* = .{
+        .name = "Mutation",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var counter: i64 = 0;
+    var increment_field = schema.Field.init(allocator, "increment", schema.TypeRef.named("Int!"));
+    increment_field.resolve = struct {
+        fn resolve(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!Value {
+            const c = @as(*i64, @ptrCast(@alignCast(ctx.?)));
+            c.* += 1;
+            return Value.fromInt(alloc, c.*);
+        }
+    }.resolve;
+    try mutation_type.kind.object.fields.put(try allocator.dupe(u8, "increment"), increment_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Mutation", mutation_type);
+    schema_def.mutation_type = mutation_type;
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var executor = Executor.init(allocator, &schema_def, backend.io());
+    defer executor.deinit();
+    executor.context.user_data = &counter;
+
+    var parser = try @import("parser.zig").Parser.init(allocator, "mutation { increment }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    // Executing twice must run the mutation resolver twice (side effects applied).
+    var result1 = try executor.execute(&doc);
+    defer result1.deinit();
+    const inc1 = result1.data.object.get("data").?.data.object.get("increment").?.data.int;
+    try std.testing.expectEqual(@as(i64, 1), inc1);
+
+    var result2 = try executor.execute(&doc);
+    defer result2.deinit();
+    const inc2 = result2.data.object.get("data").?.data.object.get("increment").?.data.int;
+    try std.testing.expectEqual(@as(i64, 2), inc2);
+}
+
+test "validator rejects mutation on schema without mutation root" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var validator = @import("validator.zig").Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+
+    var parser = try @import("parser.zig").Parser.init(allocator, "mutation { ping }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "executor default variables do not leak across executions" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var greeting_field = schema.Field.init(allocator, "greeting", schema.TypeRef.named("String!"));
+    greeting_field.resolve = struct {
+        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: Value, args: std.StringHashMap(Value)) anyerror!Value {
+            const name = args.get("name") orelse return Value.fromString(alloc, try alloc.dupe(u8, "anonymous"));
+            return Value.fromString(alloc, try alloc.dupe(u8, name.data.string));
+        }
+    }.resolve;
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "greeting"), greeting_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var executor = Executor.init(allocator, &schema_def, backend.io());
+    defer executor.deinit();
+
+    // Query with a default variable: { greeting(name: $name) } with $name defaulting to "world"
+    const query = "query Greet($name: String = \"world\") { greeting(name: $name) }";
+
+    // Run twice on the same executor: the injected default must not survive
+    // into the second execution (each run must observe the same result and
+    // the executor's variables map must end up empty).
+    {
+        var parser = try @import("parser.zig").Parser.init(allocator, query);
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+        var result = try executor.execute(&doc);
+        defer result.deinit();
+        const data = result.data.object.get("data").?;
+        const greeting = data.data.object.get("greeting").?;
+        try std.testing.expectEqualStrings("world", greeting.data.string);
+    }
+    {
+        var parser = try @import("parser.zig").Parser.init(allocator, query);
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+        var result = try executor.execute(&doc);
+        defer result.deinit();
+        const data = result.data.object.get("data").?;
+        const greeting = data.data.object.get("greeting").?;
+        try std.testing.expectEqualStrings("world", greeting.data.string);
+    }
+
+    // After both executions, the injected default must have been cleaned up.
+    try std.testing.expect(executor.context.variables.count() == 0);
+}

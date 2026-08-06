@@ -24,6 +24,8 @@ pub const DistributedCache = struct {
     allocator: std.mem.Allocator,
     backend: CacheBackend,
     prefix: []const u8,
+    /// Whether `prefix` is an owned allocation that deinit must free.
+    owns_prefix: bool,
     local_l1: ?*ResponseCache,
     /// Whether to populate L1 on L2 hits.
     l1_backfill: bool,
@@ -36,10 +38,27 @@ pub const DistributedCache = struct {
         prefix: []const u8,
         local_l1: ?*ResponseCache,
     ) DistributedCache {
+        // Copy the prefix so the caller may pass a string literal safely;
+        // deinit frees this owned copy.
+        const prefix_copy = allocator.dupe(u8, prefix) catch {
+            // Fall back to an empty prefix if allocation fails; init is
+            // infallible by API design. In this case we do not own the
+            // (empty) prefix, so deinit must not free it.
+            return .{
+                .allocator = allocator,
+                .backend = backend,
+                .prefix = "",
+                .owns_prefix = false,
+                .local_l1 = local_l1,
+                .l1_backfill = true,
+                .default_ttl_ms = if (local_l1) |l1| l1.default_ttl_ms else 5000,
+            };
+        };
         return .{
             .allocator = allocator,
             .backend = backend,
-            .prefix = prefix,
+            .prefix = prefix_copy,
+            .owns_prefix = true,
             .local_l1 = local_l1,
             .l1_backfill = true,
             .default_ttl_ms = if (local_l1) |l1| l1.default_ttl_ms else 5000,
@@ -47,7 +66,7 @@ pub const DistributedCache = struct {
     }
 
     pub fn deinit(self: *DistributedCache) void {
-        self.allocator.free(self.prefix);
+        if (self.owns_prefix) self.allocator.free(self.prefix);
     }
 
     fn makeKey(self: *DistributedCache, raw: []const u8) ![]const u8 {
@@ -352,7 +371,7 @@ test "DistributedCache L1+L2 roundtrip" {
     var dc = DistributedCache.init(
         std.testing.allocator,
         backend.cacheBackend(),
-        try std.testing.allocator.dupe(u8, "test:"),
+        "test:",
         &l1,
     );
     defer dc.deinit();
@@ -403,7 +422,7 @@ test "DistributedCache setWithDefaultTtl" {
     var dc = DistributedCache.init(
         std.testing.allocator,
         backend.cacheBackend(),
-        try std.testing.allocator.dupe(u8, "test:"),
+        "test:",
         null,
     );
     defer dc.deinit();

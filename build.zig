@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "server", .path = "examples/server.zig" },
         .{ .name = "subscription", .path = "examples/subscription.zig" },
         .{ .name = "dataloader", .path = "examples/dataloader.zig" },
+        .{ .name = "typesafe", .path = "examples/typesafe.zig" },
         .{ .name = "distributed-cache", .path = "examples/distributed_cache.zig" },
         .{ .name = "tenant", .path = "examples/tenant.zig" },
         .{ .name = "database", .path = "examples/database.zig" },

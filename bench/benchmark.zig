@@ -19,7 +19,7 @@ const BenchmarkResult = struct {
     pub fn print(self: BenchmarkResult) void {
         var avg_buf: [64]u8 = undefined;
         const avg_str = std.fmt.bufPrint(&avg_buf, "{d:.2}", .{self.avg_ns}) catch "???";
-        std.debug.print("{s:30} {d:>10} iter  {s:>10} ns/avg  {d:>10} ns/min  {d:>10} ns/max\n", .{
+        std.debug.print("{s:34} {d:>8} iter  {s:>10} ns/avg  {d:>10} ns/min  {d:>10} ns/max\n", .{
             self.name,
             self.iterations,
             avg_str,
@@ -36,6 +36,14 @@ fn runBenchmark(
     bench_fn: *const fn (allocator: std.mem.Allocator, io: Io) anyerror!void,
     allocator: std.mem.Allocator,
 ) !BenchmarkResult {
+    // Warm-up: let the allocator and scheduler reach steady state before timing.
+    {
+        var w: usize = 0;
+        while (w < iterations / 10) : (w += 1) {
+            try bench_fn(allocator, io);
+        }
+    }
+
     var total_ns: i128 = 0;
     var min_ns: i128 = std.math.maxInt(i128);
     var max_ns: i128 = 0;
@@ -69,31 +77,7 @@ fn benchParse(allocator: std.mem.Allocator, io: Io) !void {
     defer doc.deinit();
 }
 
-fn benchValidate(allocator: std.mem.Allocator, io: Io) !void {
-    _ = io;
-    const query_type = try allocator.create(zg.schema.Type);
-    query_type.* = .{
-        .name = "Query",
-        .kind = .{ .object = zg.schema.ObjectType.init(allocator) },
-    };
-    const hello_field = zg.schema.Field.init(allocator, "hello", zg.schema.TypeRef.named("String"));
-    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
-
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
-    defer schema_def.deinit();
-    try schema_def.registerType("Query", query_type);
-
-    var parser = try zg.Parser.init(allocator, "{ hello }");
-    defer parser.deinit();
-    var doc = try parser.parseDocument();
-    defer doc.deinit();
-
-    var validator = zg.Validator.init(allocator, &schema_def);
-    defer validator.deinit();
-    _ = try validator.validate(&doc);
-}
-
-fn benchExecute(allocator: std.mem.Allocator, io: Io) !void {
+fn buildQuerySchema(allocator: std.mem.Allocator) !zg.schema.Schema {
     const query_type = try allocator.create(zg.schema.Type);
     query_type.* = .{
         .name = "Query",
@@ -108,8 +92,28 @@ fn benchExecute(allocator: std.mem.Allocator, io: Io) !void {
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
     var schema_def = zg.schema.Schema.init(allocator, query_type);
-    defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
+    return schema_def;
+}
+
+fn benchValidate(allocator: std.mem.Allocator, io: Io) !void {
+    _ = io;
+    var schema_def = try buildQuerySchema(allocator);
+    defer schema_def.deinit();
+
+    var parser = try zg.Parser.init(allocator, "{ hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var validator = zg.Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    _ = try validator.validate(&doc);
+}
+
+fn benchExecute(allocator: std.mem.Allocator, io: Io) !void {
+    var schema_def = try buildQuerySchema(allocator);
+    defer schema_def.deinit();
 
     var parser = try zg.Parser.init(allocator, "{ hello }");
     defer parser.deinit();
@@ -124,22 +128,8 @@ fn benchExecute(allocator: std.mem.Allocator, io: Io) !void {
 }
 
 fn benchEndToEnd(allocator: std.mem.Allocator, io: Io) !void {
-    const query_type = try allocator.create(zg.schema.Type);
-    query_type.* = .{
-        .name = "Query",
-        .kind = .{ .object = zg.schema.ObjectType.init(allocator) },
-    };
-    var hello_field = zg.schema.Field.init(allocator, "hello", zg.schema.TypeRef.named("String"));
-    hello_field.resolve = struct {
-        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
-            return zg.Value.fromString(alloc, try alloc.dupe(u8, "world"));
-        }
-    }.resolve;
-    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
-
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try buildQuerySchema(allocator);
     defer schema_def.deinit();
-    try schema_def.registerType("Query", query_type);
 
     var parser = try zg.Parser.init(allocator, "{ hello }");
     defer parser.deinit();
@@ -171,10 +161,12 @@ pub fn main() !void {
     defer backend.deinit();
     const io = backend.io();
 
-    const iterations = 10000;
+    // Keep iterations modest so the benchmark finishes quickly under Debug.
+    // Build with -Doptimize=ReleaseFast for representative numbers.
+    const iterations = 2000;
 
     std.debug.print("\n=== zgraphql Performance Benchmark ===\n", .{});
-    std.debug.print("Iterations per benchmark: {d}\n\n", .{iterations});
+    std.debug.print("Iterations per benchmark: {d} (build with -Doptimize=ReleaseFast for production numbers)\n\n", .{iterations});
 
     const parse_result = try runBenchmark("Parse simple query", io, iterations, benchParse, allocator);
     parse_result.print();

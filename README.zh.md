@@ -104,6 +104,50 @@ pub fn main() !void {
 }
 ```
 
+### 类型安全 Schema DSL
+
+如果需要用普通 Zig 类型编写 resolver（而不是上面手动拼接 `Value` 的方式），可以使用 `TypeSafeSchemaBuilder`。它在编译期把 resolver 绑定到 schema，零运行时开销：
+
+```zig
+const AppContext = struct {
+    greeting: []const u8,
+    scale: i64,
+};
+
+const Builder = zg.TypeSafeSchemaBuilder(AppContext, .{
+    .Query = .{
+        .hello = .{
+            .type = "String!",
+            .resolve = struct {
+                fn resolve(ctx: *AppContext, alloc: std.mem.Allocator) anyerror![]const u8 {
+                    return try alloc.dupe(u8, ctx.greeting);
+                }
+            }.resolve,
+        },
+        .double = .{
+            .type = "Int!",
+            .args = .{ .value = .{ .type = "Int!" } },
+            .resolve = struct {
+                const Args = struct { value: i64 };
+                fn resolve(ctx: *AppContext, _: std.mem.Allocator, args: Args) anyerror!i64 {
+                    return args.value * ctx.scale;
+                }
+            }.resolve,
+        },
+    },
+});
+
+var schema_def = try Builder.init(allocator); // 解析 SDL 并绑定所有 resolver
+defer schema_def.deinit();
+```
+
+Resolver 签名：
+- 无参数：`fn(ctx: *Context, allocator) anyerror!ReturnType`
+- 带参数：`fn(ctx: *Context, allocator, args: ArgsStruct) anyerror!ReturnType`
+- 无需上下文时，将上下文类型设为 `void`。
+
+支持的返回类型：字符串、整数、浮点数、布尔值、可选类型、数组和结构体。不支持的类型会在编译期通过 `@compileError` 拒绝。完整的可运行示例见 [`examples/typesafe.zig`](examples/typesafe.zig)。
+
 ### 运行 HTTP 服务器
 
 ```zig
@@ -405,11 +449,10 @@ try tm.register(.{
 
 var server = zg.GraphQLServer.init(allocator, &schema_def, .{
     .tenant_manager = &tm,
-    .tenant_header = "X-Tenant-ID",
 });
 ```
 
-租户从请求头中解析（默认：`X-Tenant-ID`）。每个租户可以拥有独立的配置：
+租户从请求头中解析（默认：`X-Tenant-ID`）。如需自定义请求头，请在启动服务器前调用 `tm.setHeaderName("X-Custom-Tenant")`。每个租户可以拥有独立的配置：
 - Schema 覆盖
 - 查询深度 / 复杂度限制
 - 请求体大小限制
@@ -493,29 +536,31 @@ zig build run-stress-test
 **当前测试状态**：
 | 测试套件 | 状态 |
 |---------|------|
-| 单元测试 | 84/84 通过 |
+| 单元测试 | 115/115 通过 |
 | 集成测试 | 4/4 通过 |
 | 解析器模糊测试 | 10,000 轮，零泄漏 |
 | JSON 模糊测试 | 5,000 轮，零泄漏 |
-| 压力测试 | 约 501 ops/sec，稳定 |
+| 压力测试 | 持续负载下稳定 |
 
 ---
 
 ## 生产就绪度
 
-**评分：9.0 / 10**
+**评分：8.5 / 10**
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
-| 测试 | 9/10 | 单元、集成、模糊、压力测试全部通过 |
-| 安全 | 9/10 | 整数速率限制、CORS 修复、信号注册、无泄漏 |
-| 文档 | 9/10 | 双语文档、架构指南、API 参考 |
-| 性能 | 8/10 | 约 501 ops/sec 持续负载，无锁指标，L1+L2 缓存 |
-| 功能 | 10/10 | 完整 GraphQL 规范 + 分布式缓存 + 租户隔离 + Playground |
-| 成熟度 | 9/10 | 内置分布式缓存和租户隔离 |
+| 测试 | 8/10 | 单元、集成、模糊、压力测试全部通过；OOM 路径与 HTTP 层覆盖仍在完善 |
+| 安全 | 8/10 | 线程安全的查询缓存、泄漏检测分配器、优雅关闭 |
+| 文档 | 8/10 | 双语文档、架构指南、API 参考 |
+| 性能 | 7/10 | 异步 std.Io 执行、L1+L2 缓存、无锁指标 |
+| 功能 | 9/10 | 完整 GraphQL 规范 + 分布式缓存 + 租户隔离 + Playground |
+| 成熟度 | 8/10 | 内置分布式缓存和租户隔离 |
 
 **剩余差距**：
 1. **无内置 Redis 协议** — 提供了 HTTP 缓存后端；原生 Redis RESP 需要自定义 `CacheBackend` 实现。
+2. **OOM 注入测试** — `errdefer` 清理路径尚未在模拟分配失败下验证。
+3. **HTTP 层测试** — 服务器请求处理、WebSocket 升级和 CORS 路径缺少直接单元测试。
 
 部署指南见 [`docs/DEPLOYMENT.zh.md`](docs/DEPLOYMENT.zh.md)。
 

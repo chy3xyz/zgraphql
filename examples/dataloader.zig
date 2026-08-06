@@ -58,6 +58,10 @@ pub fn main() !void {
 
     std.debug.print("Loading {d} users...\n", .{user_ids.len});
     const users = try dl.loadMany(user_ids);
+    defer {
+        for (users) |*user| user.deinit();
+        allocator.free(users);
+    }
 
     std.debug.print("Results:\n", .{});
     for (users, 0..) |user, i| {
@@ -68,12 +72,20 @@ pub fn main() !void {
 
     // Load the same key again - it hits the cache, no DB call.
     const cached = dl.load("1");
+    defer if (cached) |c| {
+        var owned = c;
+        owned.deinit();
+    };
     std.debug.print("\nCache hit for '1': {s}\n", .{if (cached != null) "yes" else "no"});
 
     // Second batch load
     const more_ids = &.{ "1", "3", "6" };
     std.debug.print("\nLoading {d} more users (some already cached)...\n", .{more_ids.len});
     const more = try dl.loadMany(more_ids);
+    defer {
+        for (more) |*user| user.deinit();
+        allocator.free(more);
+    }
     for (more, 0..) |user, i| {
         const id = user.data.object.get("id").?.data.string;
         const name = user.data.object.get("name").?.data.string;

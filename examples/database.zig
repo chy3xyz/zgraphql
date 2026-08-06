@@ -151,7 +151,8 @@ fn userResolver(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, args: s
     var key_buf: [32]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{d}", .{id});
     if (app.dl.load(key)) |cached| {
-        return cached.clone();
+        // load() already returns an owned clone; return it directly.
+        return cached;
     }
 
     if (app.db.getById(id)) |u| {

@@ -6,11 +6,20 @@ const std = @import("std");
 /// 1. **Whitelist**: Only allow queries that have been explicitly registered.
 /// 2. **APQ**: Store queries by hash, clients send hash instead of full query.
 ///
+/// Thread safety: all public methods are internally synchronized with a
+/// spin lock, so a single `QueryCache` instance may be shared across
+/// concurrent requests.
 pub const QueryCache = struct {
     allocator: std.mem.Allocator,
     // hash -> query string
     queries: std.StringHashMap([]const u8),
+    mutex: std.atomic.Mutex = .unlocked,
 
+    fn lockMutex(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
 
     pub fn init(allocator: std.mem.Allocator) QueryCache {
         return .{
@@ -30,6 +39,9 @@ pub const QueryCache = struct {
 
     /// Register a query. Computes SHA-256 hash as the key.
     pub fn store(self: *QueryCache, query: []const u8) !void {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
         const hash = try computeHash(self.allocator, query);
         errdefer self.allocator.free(hash);
 
@@ -46,6 +58,9 @@ pub const QueryCache = struct {
 
     /// Register a query with an explicit key (e.g., a human-readable name).
     pub fn storeNamed(self: *QueryCache, key: []const u8, query: []const u8) !void {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
 
@@ -61,22 +76,35 @@ pub const QueryCache = struct {
         try self.queries.put(key_copy, query_copy);
     }
 
-    /// Look up a query by hash/key. Returns null if not found.
+    /// Look up a query by hash/key. Returns an owned copy, or null if not found.
+    /// Caller owns the returned string and must free it.
     pub fn get(self: *QueryCache, hash: []const u8) ?[]const u8 {
-        return self.queries.get(hash);
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
+        const q = self.queries.get(hash) orelse return null;
+        return self.allocator.dupe(u8, q) catch null;
     }
 
-    /// Look up a query by hash/key, case-insensitive. Returns null if not found.
+    /// Look up a query by hash/key, case-insensitive. Returns an owned copy,
+    /// or null if not found. Caller owns the returned string and must free it.
     pub fn getInsensitive(self: *QueryCache, hash: []const u8) ?[]const u8 {
-        if (self.queries.get(hash)) |q| return q;
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
+        if (self.queries.get(hash)) |q| return self.allocator.dupe(u8, q) catch null;
         var lower_buf: [64]u8 = undefined;
         if (hash.len > lower_buf.len) return null;
         const lower = std.ascii.lowerString(&lower_buf, hash);
-        return self.queries.get(lower);
+        if (self.queries.get(lower)) |q| return self.allocator.dupe(u8, q) catch null;
+        return null;
     }
 
     /// Check if a query is in the cache. Zero-allocation: uses stack buffer for hash.
     pub fn contains(self: *QueryCache, query: []const u8) bool {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
         var hex_buf: [64]u8 = undefined;
         computeHashBuf(query, &hex_buf);
         return self.queries.contains(&hex_buf);
@@ -84,6 +112,9 @@ pub const QueryCache = struct {
 
     /// Remove a query from the cache.
     pub fn remove(self: *QueryCache, hash: []const u8) void {
+        lockMutex(&self.mutex);
+        defer self.mutex.unlock();
+
         if (self.queries.fetchRemove(hash)) |old| {
             self.allocator.free(old.key);
             self.allocator.free(old.value);
@@ -120,6 +151,7 @@ test "query cache store and get" {
     defer allocator.free(hash);
 
     const retrieved = cache.get(hash);
+    defer if (retrieved) |r| allocator.free(r);
     try std.testing.expect(retrieved != null);
     try std.testing.expectEqualStrings(query, retrieved.?);
 }
@@ -133,6 +165,7 @@ test "query cache named store" {
     try cache.storeNamed("getUser", "query GetUser($id: ID!) { user(id: $id) { name } }");
 
     const retrieved = cache.get("getUser");
+    defer if (retrieved) |r| allocator.free(r);
     try std.testing.expect(retrieved != null);
     try std.testing.expectEqualStrings("query GetUser($id: ID!) { user(id: $id) { name } }", retrieved.?);
 }
@@ -167,6 +200,24 @@ test "query cache case insensitive get" {
     defer allocator.free(upper);
     _ = std.ascii.upperString(upper, hash);
 
-    try std.testing.expect(cache.getInsensitive(upper) != null);
+    const via_upper = cache.getInsensitive(upper);
+    defer if (via_upper) |r| allocator.free(r);
+    try std.testing.expect(via_upper != null);
     try std.testing.expect(cache.get(upper) == null); // exact match fails
+}
+
+test "query cache remove frees entry" {
+    const allocator = std.testing.allocator;
+
+    var cache = QueryCache.init(allocator);
+    defer cache.deinit();
+
+    try cache.store("{ hello }");
+    const hash = try QueryCache.computeHash(allocator, "{ hello }");
+    defer allocator.free(hash);
+
+    try std.testing.expect(cache.contains("{ hello }"));
+    cache.remove(hash);
+    try std.testing.expect(!cache.contains("{ hello }"));
+    try std.testing.expect(cache.get(hash) == null);
 }

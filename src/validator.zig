@@ -56,6 +56,8 @@ pub const Validator = struct {
     }
 
     pub fn validate(self: *Validator, doc: *ast.Document) !ValidationResult {
+        // Deinit any previous result to avoid leaking when the validator is reused.
+        self.result.deinit();
         self.result = ValidationResult.init(self.allocator);
 
         // Clear stale state from previous validation (prevents UAF on reuse)
@@ -235,12 +237,7 @@ pub const Validator = struct {
         }
         if (std.mem.eql(u8, field.name, "__schema")) {
             try self.validateDirectives(field.directives, .field);
-            if (field.selection_set) |*ss| {
-                const schema_type = self.schema_def.getType("__Schema");
-                if (schema_type) |st| {
-                    try self.validateSelectionSet(ss, st, validated_fragments);
-                }
-            }
+            try self.validateIntrospectionSelectionSet(field, "__Schema");
             return;
         }
         if (std.mem.eql(u8, field.name, "__type")) {
@@ -254,12 +251,7 @@ pub const Validator = struct {
                     try self.result.addError("Unknown argument on __type", field.line, field.col);
                 }
             }
-            if (field.selection_set) |*ss| {
-                const type_type = self.schema_def.getType("__Type");
-                if (type_type) |tt| {
-                    try self.validateSelectionSet(ss, tt, validated_fragments);
-                }
-            }
+            try self.validateIntrospectionSelectionSet(field, "__Type");
             return;
         }
 
@@ -361,8 +353,76 @@ pub const Validator = struct {
         }
     }
 
-    fn validateDirectives(self: *Validator, directives: std.array_list.Managed(ast.Directive), location: schema.DirectiveLocation) ValidateError!void {
-        var seen = std.StringHashMap(void).init(self.allocator);
+    /// Validate the sub-selection of an introspection meta-field (__schema / __type).
+    /// The introspection types are not part of the user schema, so this uses a
+    /// static description of the GraphQL introspection type system instead of
+    /// looking them up in `schema_def` (which previously made the check a no-op).
+    fn validateIntrospectionSelectionSet(self: *Validator, field: *ast.Field, intro_type: []const u8) ValidateError!void {
+        const ss = field.selection_set orelse {
+            try self.result.addError("Introspection field must have a sub-selection", field.line, field.col);
+            return;
+        };
+
+        for (ss.selections.items) |*sel| {
+            switch (sel.*) {
+                .field => |*sub| try self.validateIntrospectionField(sub, intro_type),
+                .fragment_spread, .inline_fragment => {
+                    const lc = sub_line_col(sel);
+                    try self.result.addError("Fragments are not supported inside introspection selections", lc.line, lc.col);
+                },
+            }
+        }
+    }
+
+    fn validateIntrospectionField(self: *Validator, sub: *ast.Field, intro_type: []const u8) ValidateError!void {
+        if (std.mem.eql(u8, sub.name, "__typename")) return;
+
+        const field_def = introspectionFieldDef(intro_type, sub.name) orelse {
+            try self.result.addError("Field does not exist on introspection type", sub.line, sub.col);
+            return;
+        };
+
+        // Validate arguments
+        for (sub.arguments.items) |arg| {
+            if (field_def.args.len == 0) {
+                try self.result.addError("Field does not accept arguments", sub.line, sub.col);
+            } else {
+                var found = false;
+                for (field_def.args) |arg_name| {
+                    if (std.mem.eql(u8, arg.name, arg_name)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    try self.result.addError("Unknown argument on introspection field", sub.line, sub.col);
+                }
+            }
+        }
+
+        // A field whose type is a composite introspection type must have a sub-selection.
+        if (field_def.nested_type) |nested| {
+            if (sub.selection_set == null) {
+                try self.result.addError("Field requires a sub-selection", sub.line, sub.col);
+                return;
+            }
+            try self.validateIntrospectionSelectionSet(sub, nested);
+        } else {
+            if (sub.selection_set != null) {
+                try self.result.addError("Field must not have a sub-selection", sub.line, sub.col);
+            }
+        }
+    }
+
+    fn sub_line_col(sel: *const ast.Selection) struct { line: ?usize, col: ?usize } {
+        return switch (sel.*) {
+            .field => |f| .{ .line = f.line, .col = f.col },
+            .fragment_spread => |f| .{ .line = f.line, .col = f.col },
+            .inline_fragment => |f| .{ .line = f.line, .col = f.col },
+        };
+    }
+
+    fn validateDirectives(self: *Validator, directives: std.array_list.Managed(ast.Directive), location: schema.DirectiveLocation) ValidateError!void {        var seen = std.StringHashMap(void).init(self.allocator);
         defer seen.deinit();
 
         for (directives.items) |dir| {
@@ -1017,4 +1077,152 @@ test "validator directive not repeatable" {
         if (std.mem.indexOf(u8, err.message, "Directive is not repeatable") != null) found = true;
     }
     try std.testing.expect(found);
+}
+
+/// Static description of the GraphQL introspection type system, used to
+/// validate `__schema` / `__type` sub-selections without registering the
+/// introspection types into the user schema.
+const IntrospectionFieldDef = struct {
+    /// Names of accepted arguments (empty = no arguments).
+    args: []const []const u8,
+    /// If non-null, this field's type is a composite introspection type and
+    /// the field requires a sub-selection validated against `nested_type`.
+    nested_type: ?[]const u8 = null,
+};
+
+fn introspectionFieldDef(type_name: []const u8, field_name: []const u8) ?IntrospectionFieldDef {
+    // __Schema
+    if (std.mem.eql(u8, type_name, "__Schema")) {
+        if (std.mem.eql(u8, field_name, "types")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "queryType")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "mutationType")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "subscriptionType")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "directives")) return .{ .args = &.{}, .nested_type = "__Directive" };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        return null;
+    }
+    // __Type
+    if (std.mem.eql(u8, type_name, "__Type")) {
+        if (std.mem.eql(u8, field_name, "kind")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "name")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "fields")) return .{ .args = &.{"includeDeprecated"}, .nested_type = "__Field" };
+        if (std.mem.eql(u8, field_name, "interfaces")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "possibleTypes")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "enumValues")) return .{ .args = &.{"includeDeprecated"}, .nested_type = "__EnumValue" };
+        if (std.mem.eql(u8, field_name, "inputFields")) return .{ .args = &.{"includeDeprecated"}, .nested_type = "__InputValue" };
+        if (std.mem.eql(u8, field_name, "ofType")) return .{ .args = &.{}, .nested_type = "__Type" };
+        return null;
+    }
+    // __Field
+    if (std.mem.eql(u8, type_name, "__Field")) {
+        if (std.mem.eql(u8, field_name, "name")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "args")) return .{ .args = &.{"includeDeprecated"}, .nested_type = "__InputValue" };
+        if (std.mem.eql(u8, field_name, "type")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "isDeprecated")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "deprecationReason")) return .{ .args = &.{} };
+        return null;
+    }
+    // __InputValue
+    if (std.mem.eql(u8, type_name, "__InputValue")) {
+        if (std.mem.eql(u8, field_name, "name")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "type")) return .{ .args = &.{}, .nested_type = "__Type" };
+        if (std.mem.eql(u8, field_name, "defaultValue")) return .{ .args = &.{} };
+        return null;
+    }
+    // __EnumValue
+    if (std.mem.eql(u8, type_name, "__EnumValue")) {
+        if (std.mem.eql(u8, field_name, "name")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "isDeprecated")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "deprecationReason")) return .{ .args = &.{} };
+        return null;
+    }
+    // __Directive
+    if (std.mem.eql(u8, type_name, "__Directive")) {
+        if (std.mem.eql(u8, field_name, "name")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "description")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "locations")) return .{ .args = &.{} };
+        if (std.mem.eql(u8, field_name, "args")) return .{ .args = &.{"includeDeprecated"}, .nested_type = "__InputValue" };
+        if (std.mem.eql(u8, field_name, "isRepeatable")) return .{ .args = &.{} };
+        return null;
+    }
+    return null;
+}
+
+test "validator validates introspection __schema sub-selection" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    // Valid introspection query must pass validation.
+    {
+        var validator = Validator.init(allocator, &schema_def);
+        defer validator.deinit();
+        var parser = try @import("parser.zig").Parser.init(allocator, "{ __schema { queryType { name } types { name } } }");
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+        const result = try validator.validate(&doc);
+        try std.testing.expect(result.isValid());
+    }
+
+    // Unknown field on __Schema must be rejected.
+    {
+        var validator = Validator.init(allocator, &schema_def);
+        defer validator.deinit();
+        var parser = try @import("parser.zig").Parser.init(allocator, "{ __schema { bogusField } }");
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+        const result = try validator.validate(&doc);
+        try std.testing.expect(!result.isValid());
+    }
+
+    // Leaf field with a sub-selection must be rejected.
+    {
+        var validator = Validator.init(allocator, &schema_def);
+        defer validator.deinit();
+        var parser = try @import("parser.zig").Parser.init(allocator, "{ __schema { description { x } } }");
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+        const result = try validator.validate(&doc);
+        try std.testing.expect(!result.isValid());
+    }
+}
+
+test "validator validates introspection __type sub-selection" {
+    const allocator = std.testing.allocator;
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    var parser = try @import("parser.zig").Parser.init(allocator, "{ __type(name: \"Query\") { name fields { name type { name } } } }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(result.isValid());
 }

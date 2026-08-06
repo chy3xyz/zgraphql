@@ -44,8 +44,8 @@ jobs:
 
       - name: Run fuzz tests (5 minutes each)
         run: |
-          timeout 300 zig build run-parser-fuzz || true
-          timeout 300 zig build run-json-fuzz || true
+          timeout 300 zig build run-parser-fuzz; code=$?; if [ $code -ne 0 ] && [ $code -ne 124 ]; then exit $code; fi
+          timeout 300 zig build run-json-fuzz; code=$?; if [ $code -ne 0 ] && [ $code -ne 124 ]; then exit $code; fi
 
   leak-check:
     runs-on: ubuntu-latest
@@ -59,3 +59,18 @@ jobs:
 
       - name: Run tests with leak detection
         run: zig test src/zgraphql.zig -OReleaseSafe
+
+  stress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.17.0
+
+      - name: Run stress test (60s sustained load)
+        run: |
+          zig build -Doptimize=ReleaseSafe
+          timeout 90 ./zig-out/bin/stress-test

@@ -666,6 +666,33 @@ fn findTraceparent(head_buffer: []const u8) ?[]const u8 {
     return std.mem.trim(u8, head_buffer[value_start..line_end], " ");
 }
 
+/// Returns true if the query document's first operation is a query (not a
+/// mutation or subscription). Used to decide response-cache eligibility before
+/// parsing. Conservative lexical check: skips whitespace and comments, then
+/// inspects the first keyword. Anonymous operations (`{ ... }`) are queries.
+fn queryIsQuery(query: []const u8) bool {
+    var i: usize = 0;
+    while (i < query.len) {
+        const c = query[i];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            i += 1;
+            continue;
+        }
+        if (c == '#') {
+            while (i < query.len and query[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        break;
+    }
+    const rest = query[i..];
+    if (rest.len == 0) return false;
+    if (rest[0] == '{') return true; // anonymous operation → query
+    if (std.mem.startsWith(u8, rest, "query")) return true;
+    if (std.mem.startsWith(u8, rest, "mutation")) return false;
+    if (std.mem.startsWith(u8, rest, "subscription")) return false;
+    return false; // fragment-only or unknown document shape
+}
+
 /// Execute a GraphQL query string and return the JSON response.
 /// Caller owns the returned json_str memory.
 fn executeGraphQLAndGetJson(
@@ -702,8 +729,9 @@ fn executeGraphQLAndGetJson(
         }
     }
 
-    // Response cache check (only for queries without runtime variables)
-    const cacheable = variables.count() == 0;
+    // Response cache check (only for cacheable queries: no runtime variables,
+    // and the operation is a query — never a mutation or subscription)
+    const cacheable = variables.count() == 0 and queryIsQuery(query);
     if (cacheable) {
         // Check distributed cache (L2) first
         if (self.options.distributed_cache) |dc| {
@@ -717,8 +745,9 @@ fn executeGraphQLAndGetJson(
         if (self.options.response_cache) |cache| {
             const now_ts = Io.Clock.Timestamp.now(io, .real);
             const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
+            // cache.get returns an owned copy; transfer ownership to the caller.
             if (cache.get(query, now_ms)) |cached| {
-                return .{ .json_str = try self.allocator.dupe(u8, cached), .complexity = 0, .had_error = false };
+                return .{ .json_str = cached, .complexity = 0, .had_error = false };
             }
         }
     }
@@ -790,11 +819,17 @@ fn executeGraphQLAndGetJson(
         var error_json = Value.initObject(self.allocator);
         defer error_json.deinit();
         var errors = Value.initList(self.allocator);
+        errdefer errors.deinit();
         for (validation_result.errors.items) |err| {
             var err_obj = Value.initObject(self.allocator);
+            errdefer err_obj.deinit();
             try err_obj.data.object.put(try self.allocator.dupe(u8, "message"), Value.fromString(self.allocator, try self.allocator.dupe(u8, err.message)));
             if (err.line != null or err.col != null) {
                 var loc = Value.initObject(self.allocator);
+                // Ownership of loc transfers to `locations` on append below;
+                // the loc errdefer is only active until that point.
+                var loc_owned = true;
+                errdefer if (loc_owned) loc.deinit();
                 if (err.line) |line| {
                     try loc.data.object.put(try self.allocator.dupe(u8, "line"), Value.fromInt(self.allocator, @intCast(line)));
                 }
@@ -802,7 +837,9 @@ fn executeGraphQLAndGetJson(
                     try loc.data.object.put(try self.allocator.dupe(u8, "column"), Value.fromInt(self.allocator, @intCast(col)));
                 }
                 var locations = Value.initList(self.allocator);
+                errdefer locations.deinit();
                 try locations.data.list.append(loc);
+                loc_owned = false;
                 try err_obj.data.object.put(try self.allocator.dupe(u8, "locations"), locations);
             }
             try errors.data.list.append(err_obj);
@@ -829,8 +866,13 @@ fn executeGraphQLAndGetJson(
 
     var result = executor.executeNamed(&doc, operation_name) catch |err| {
         log.err("execution error: {s}", .{@errorName(err)});
+        // Surface the concrete error name (e.g. ResolverError, InvalidInput)
+        // instead of a generic "Execution error" to aid diagnosis. The error
+        // name is a safe, non-sensitive identifier.
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Execution error ({s})", .{@errorName(err)}) catch "Execution error";
         return .{
-            .json_str = try buildErrorJson(self.allocator, "Execution error"),
+            .json_str = try buildErrorJson(self.allocator, msg),
             .complexity = complexity,
             .had_error = true,
         };
@@ -1026,10 +1068,19 @@ fn verifyApqSignature(secret: ?[]const u8, hash: []const u8, signature: ?[]const
 }
 
 /// Resolve an APQ (Automatic Persisted Query) hash.
-/// Returns the query string to execute, or null if an error response was already sent.
+/// Returns an owned query string to execute, or null if an error response was already sent.
+/// Caller owns the returned string (if non-null) and must free it.
+///
+/// Ownership contract: `provided_query` must be owned by the caller. This
+/// function takes ownership: on success it either returns `provided_query`
+/// itself (transferring ownership back) or returns a fresh owned copy; on
+/// business failure (returning null) it frees `provided_query`. On error
+/// propagation (an error is returned) `provided_query` is NOT freed — the
+/// caller's own cleanup (e.g. a deferred free) remains responsible for it.
 fn resolvePersistedQuery(self: *GraphQLServer, request: *http.Server.Request, hash: []const u8, provided_query: ?[]const u8, signature: ?[]const u8, origin: []const u8) !?[]const u8 {
     if (!verifyApqSignature(self.options.apq_hmac_secret, hash, signature)) {
         try sendGraphQLErrorResponse(self.allocator, request, "PersistedQuery.InvalidSignature", .bad_request, origin);
+        if (provided_query) |q| self.allocator.free(q);
         return null;
     }
 
@@ -1037,12 +1088,15 @@ fn resolvePersistedQuery(self: *GraphQLServer, request: *http.Server.Request, ha
         // No cache configured; if whitelist is on, reject
         if (self.options.enforce_query_whitelist) {
             try sendGraphQLErrorResponse(self.allocator, request, "PersistedQueryNotFound", .ok, origin);
+            if (provided_query) |q| self.allocator.free(q);
             return null;
         }
         return provided_query;
     };
 
+    // Cache hit: getInsensitive returns an owned copy. The caller frees it.
     if (cache.getInsensitive(hash)) |cached_query| {
+        if (provided_query) |q| self.allocator.free(q);
         return cached_query;
     }
 
@@ -1058,6 +1112,7 @@ fn resolvePersistedQuery(self: *GraphQLServer, request: *http.Server.Request, ha
         };
         if (!hash_match) {
             try sendGraphQLErrorResponse(self.allocator, request, "Provided sha does not match query", .bad_request, origin);
+            self.allocator.free(query);
             return null;
         }
 
@@ -1075,17 +1130,27 @@ fn resolvePersistedQuery(self: *GraphQLServer, request: *http.Server.Request, ha
 
 /// Batch-safe variant of resolvePersistedQuery that does not send HTTP responses.
 /// Returns null on any APQ failure (caller should produce a GraphQL error JSON).
+///
+/// Ownership contract (same as resolvePersistedQuery): `provided_query` must be
+/// owned by the caller. On success this returns an owned string (either
+/// `provided_query` itself or a fresh copy); on failure it frees
+/// `provided_query` and returns null.
 fn resolvePersistedQueryBatch(self: *GraphQLServer, hash: []const u8, provided_query: ?[]const u8, signature: ?[]const u8) !?[]const u8 {
     if (!verifyApqSignature(self.options.apq_hmac_secret, hash, signature)) {
+        if (provided_query) |q| self.allocator.free(q);
         return null;
     }
 
     const cache = self.options.query_cache orelse {
-        if (self.options.enforce_query_whitelist) return null;
+        if (self.options.enforce_query_whitelist) {
+            if (provided_query) |q| self.allocator.free(q);
+            return null;
+        }
         return provided_query;
     };
 
     if (cache.getInsensitive(hash)) |cached_query| {
+        if (provided_query) |q| self.allocator.free(q);
         return cached_query;
     }
 
@@ -1098,7 +1163,10 @@ fn resolvePersistedQueryBatch(self: *GraphQLServer, hash: []const u8, provided_q
             _ = std.ascii.lowerString(lower_hash, hash);
             break :blk std.mem.eql(u8, computed, lower_hash);
         };
-        if (!hash_match) return null;
+        if (!hash_match) {
+            self.allocator.free(query);
+            return null;
+        }
 
         if (!self.options.enforce_query_whitelist) {
             try cache.store(query);
@@ -1142,9 +1210,16 @@ fn executeBatch(
         const obj = item.object;
         var batch_query_str: ?[]const u8 = null;
         var batch_op_name: ?[]const u8 = null;
+        // batch_query_str is always owned (either a dupe of the body query or
+        // an owned copy returned by resolvePersistedQueryBatch). It may be
+        // replaced by resolvePersistedQueryBatch, which takes ownership of the
+        // value it is passed, so only the final value is freed here.
+        defer {
+            if (batch_query_str) |q| self.allocator.free(q);
+        }
 
         if (obj.get("query")) |q| {
-            if (q == .string) batch_query_str = q.string;
+            if (q == .string) batch_query_str = try self.allocator.dupe(u8, q.string);
         }
         if (obj.get("operationName")) |op| {
             if (op == .string) batch_op_name = op.string;

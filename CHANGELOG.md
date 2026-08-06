@@ -5,7 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-06
+
+### Fixed
+- **APQ use-after-free**: `resolvePersistedQuery` returned a `QueryCache` internal pointer that was freed by the caller, dangling the cache entry and double-freeing at shutdown. Cache lookups now return owned copies (matching `ResponseCache` semantics).
+- **APQ error-path double free**: `provided_query` was freed before sending the error response; on error propagation the caller's deferred free then freed it again. Error responses are now sent before ownership is released.
+- **Response cache leak**: L1 cache hit path duplicated an already-owned copy and leaked the first one.
+- **QueryCache thread safety**: `QueryCache` was lock-free and unsafe under concurrent requests; all methods now use an internal spin lock.
+- **Mutation/subscription response caching**: mutations (and subscriptions) with no variables were incorrectly cached and replayed; cacheable checks now verify the operation is a query.
+- **`TenantManager` header ownership**: `setHeaderName`/`deinit` decided whether to free by comparing content to the default literal, leaking when the same string was heap-allocated; replaced with an explicit ownership flag.
+- **`TenantManager.register` OOM cleanup**: `errdefer` freed uninitialized elements of the roles array on partial allocation failure; now tracks the filled count.
+- **Cross-request variable leakage in `Executor`**: default variable values injected by `executeNamed` were never cleaned up, leaking into subsequent executions on a reused executor (and a double-free in the cleanup path).
+- **Introspection validation no-op**: `__schema`/`__type` sub-selections were never actually validated because the introspection types are not registered in the user schema; added a real validator over the static introspection type system.
+- **`DistributedCache` prefix lifetime**: `init` stored the caller's prefix by reference and `deinit` freed it, crashing on string literals; the prefix is now copied and ownership-tracked.
+- **Validation error payload OOM leaks**: partially built error objects were not cleaned up on allocation failure.
+- **Documentation errors**: README used a non-existent `ServerOptions.tenant_header` field; `DistributedCache` examples passed string literals as prefix; the subscription example bound `resolve` instead of `subscribe`; `docs/DEPLOYMENT.md` contradicted itself about tenant isolation.
+- **Example memory leaks**: `examples/dataloader.zig` and `examples/database.zig` leaked loaded values (double clone / missing deinit); `examples/complex.zig` used enum workarounds, an unused subscription, and redundant root-type wiring.
+- **CI**: fuzz job swallowed failures with `|| true`; stress test was never run in CI; both are now enforced.
+- **Error observability**: execution errors returned a generic "Execution error"; the response now includes the concrete error name, and GraphQL errors include `locations` (line/column).
+
+### Added
+- `examples/typesafe.zig`: runnable `TypeSafeSchemaBuilder` example.
+- Mutation end-to-end tests (executor side effects, validator rejection without mutation root).
+- Introspection validation tests (valid/unknown-field/leaf-with-sub-selection).
+- Benchmark warm-up and schema-build-out-of-hot-loop improvements.
 
 ## [0.3.1] - 2026-07-23
 
@@ -60,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
-[Unreleased]: https://github.com/chy3xyz/zgraphql/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/chy3xyz/zgraphql/compare/v0.3.1...v0.4.0
 [0.3.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.3.0
 [0.1.1]: https://github.com/chy3xyz/zgraphql/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.1.0
