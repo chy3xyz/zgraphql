@@ -95,7 +95,7 @@ pub const Executor = struct {
         var viter = self.context.variables.iterator();
         while (viter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.context.variables.deinit();
         self.clearFragments();
@@ -139,7 +139,7 @@ pub const Executor = struct {
         var iter = self.context.variables.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.context.variables.clearRetainingCapacity();
 
@@ -147,8 +147,8 @@ pub const Executor = struct {
         while (src_iter.next()) |entry| {
             const key = try self.allocator.dupe(u8, entry.key_ptr.*);
             errdefer self.allocator.free(key);
-            var val = try entry.value_ptr.clone();
-            errdefer val.deinit();
+            var val = try entry.value_ptr.clone(self.allocator);
+            errdefer val.deinit(self.allocator);
             try self.context.variables.put(key, val);
         }
     }
@@ -217,7 +217,7 @@ pub const Executor = struct {
                 if (self.context.variables.fetchRemove(k.*)) |removed| {
                     self.allocator.free(removed.key);
                     var val = removed.value;
-                    val.deinit();
+                    val.deinit(self.allocator);
                 }
             }
             injected_defaults.deinit();
@@ -231,7 +231,7 @@ pub const Executor = struct {
                     const default_val = try self.coerceValue(dv.*);
                     errdefer if (key_owned) {
                         var val = default_val;
-                        val.deinit();
+                        val.deinit(self.allocator);
                     };
                     try self.context.variables.put(var_key, default_val);
                     // var_key ownership now transferred to context.variables.
@@ -241,7 +241,7 @@ pub const Executor = struct {
                         if (self.context.variables.fetchRemove(var_key)) |removed| {
                             self.allocator.free(removed.key);
                             var val = removed.value;
-                            val.deinit();
+                            val.deinit(self.allocator);
                         }
                         return e;
                     };
@@ -260,7 +260,7 @@ pub const Executor = struct {
         };
 
         var result = Value.initObject(self.allocator);
-        errdefer result.deinit();
+        errdefer result.deinit(self.allocator);
 
         const data = try self.executeSelectionSet(&op.selection_set, root_type, Value.fromNull(self.allocator));
         try self.putResultField(&result, "data", data);
@@ -268,13 +268,13 @@ pub const Executor = struct {
         // Attach errors if any were collected during execution
         if (self.errors.items.len > 0) {
             var errors_list = Value.initList(self.allocator);
-            errdefer errors_list.deinit();
+            errdefer errors_list.deinit(self.allocator);
             for (self.errors.items) |err| {
                 var err_obj = Value.initObject(self.allocator);
                 try err_obj.data.object.put(try self.allocator.dupe(u8, "message"), Value.fromString(self.allocator, try self.allocator.dupe(u8, err.message)));
                 if (err.path) |path| {
                     var path_list = Value.initList(self.allocator);
-                    errdefer path_list.deinit();
+                    errdefer path_list.deinit(self.allocator);
                     for (path) |segment| {
                         try path_list.data.list.append(Value.fromString(self.allocator, try self.allocator.dupe(u8, segment)));
                     }
@@ -282,9 +282,9 @@ pub const Executor = struct {
                 }
                 if (err.line != null and err.col != null) {
                     var loc_list = Value.initList(self.allocator);
-                    errdefer loc_list.deinit();
+                    errdefer loc_list.deinit(self.allocator);
                     var loc = Value.initObject(self.allocator);
-                    errdefer loc.deinit();
+                    errdefer loc.deinit(self.allocator);
                     // line/col are usize from the AST; cast defensively (they are
                     // always small in practice, but never overflow silently).
                     const line_i64 = std.math.cast(i64, err.line.?) orelse 0;
@@ -358,7 +358,7 @@ pub const Executor = struct {
             var aiter = args.iterator();
             while (aiter.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit();
+                entry.value_ptr.deinit(self.allocator);
             }
             args.deinit();
         }
@@ -368,7 +368,7 @@ pub const Executor = struct {
             const arg_key = try self.allocator.dupe(u8, arg.name);
             errdefer self.allocator.free(arg_key);
             args.put(arg_key, arg_value) catch |err| {
-                arg_value.deinit();
+                arg_value.deinit(self.allocator);
                 self.allocator.free(arg_key);
                 return err;
             };
@@ -379,11 +379,11 @@ pub const Executor = struct {
         while (sub_def_iter.next()) |entry| {
             if (args.contains(entry.key_ptr.*)) continue;
             if (entry.value_ptr.default_value) |dv| {
-                var default_clone = try dv.clone();
-                errdefer default_clone.deinit();
+                var default_clone = try dv.clone(self.allocator);
+                errdefer default_clone.deinit(self.allocator);
                 const key = try self.allocator.dupe(u8, entry.key_ptr.*);
                 args.put(key, default_clone) catch |err| {
-                    default_clone.deinit();
+                    default_clone.deinit(self.allocator);
                     self.allocator.free(key);
                     return err;
                 };
@@ -437,18 +437,18 @@ pub const Executor = struct {
         if (field_type) |ft| {
             if (ctx.sub_field.selection_set) |*fss| {
                 const data = ctx.executor.executeSelectionSet(fss, ft, parent_value) catch |err| {
-                    parent_value.deinit();
+                    parent_value.deinit(allocator);
                     return err;
                 };
-                parent_value.deinit();
+                parent_value.deinit(allocator);
 
                 var result = Value.initObject(allocator);
-                errdefer result.deinit();
+                errdefer result.deinit(allocator);
                 try result.data.object.put(try allocator.dupe(u8, "data"), data);
 
                 if (ctx.executor.errors.items.len > 0) {
                     var errors_list = Value.initList(allocator);
-                    errdefer errors_list.deinit();
+                    errdefer errors_list.deinit(allocator);
                     for (ctx.executor.errors.items) |err| {
                         var err_obj = Value.initObject(allocator);
                         try err_obj.data.object.put(try allocator.dupe(u8, "message"), Value.fromString(allocator, try allocator.dupe(u8, err.message)));
@@ -464,7 +464,7 @@ pub const Executor = struct {
 
         // No selection set: return the parent value directly wrapped in data
         var result = Value.initObject(allocator);
-        errdefer result.deinit();
+        errdefer result.deinit(allocator);
         try result.data.object.put(try allocator.dupe(u8, "data"), parent_value);
         return result;
     }
@@ -486,7 +486,7 @@ pub const Executor = struct {
 
     fn executeSelectionSetWithPath(self: *Executor, ss: *ast.SelectionSet, parent_type: *schema.Type, parent_value: Value, path_prefix: []const []const u8) ExecutionError!Value {
         var result = Value.initObject(self.allocator);
-        errdefer result.deinit();
+        errdefer result.deinit(self.allocator);
 
         // Merge fields with same response key (alias or name)
         var grouped_fields = std.StringHashMap(std.array_list.Managed(*ast.Field)).init(self.allocator);
@@ -639,7 +639,7 @@ pub const Executor = struct {
     /// released so no memory leaks from partially built results.
     fn putResultField(self: *Executor, result: *Value, key: []const u8, field_value: Value) std.mem.Allocator.Error!void {
         var value = field_value;
-        errdefer value.deinit();
+        errdefer value.deinit(self.allocator);
         const key_copy = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(key_copy);
         try result.data.object.put(key_copy, value);
@@ -649,7 +649,7 @@ pub const Executor = struct {
         const field_type_name = field_def.field_type.innerTypeName();
         const field_type = self.schema_def.getType(field_type_name);
         if (field_type == null) {
-            const clone = try parent_value.clone();
+            const clone = try parent_value.clone(self.allocator);
             return clone;
         }
 
@@ -666,7 +666,7 @@ pub const Executor = struct {
             // For [T!] (non-null element), a null element must bubble to null the whole list.
             const elem_non_null = elem_type.kind == .non_null;
             var results = Value.initList(self.allocator);
-            errdefer results.deinit();
+            errdefer results.deinit(self.allocator);
             if (parent_value.data == .list) {
                 for (parent_value.data.list.items) |*item| {
                     const item_result = self.executeSelectionSetWithPath(ss, field_type.?, item.*, path) catch |err| switch (err) {
@@ -674,7 +674,7 @@ pub const Executor = struct {
                         else => |e| blk: {
                             try self.recordError(e, field_def.name, path, null);
                             if (elem_non_null) {
-                                results.deinit();
+                                results.deinit(self.allocator);
                                 // If outer type is also non-null, bubble further
                                 if (outer_is_non_null) return error.NullValueForNonNull;
                                 return Value.fromNull(self.allocator);
@@ -763,7 +763,7 @@ pub const Executor = struct {
                 for (dir.arguments.items) |arg| {
                     if (std.mem.eql(u8, arg.name, "if")) {
                         var val = try self.coerceValue(arg.value);
-                        defer val.deinit();
+                        defer val.deinit(self.allocator);
                         if (val.data == .boolean and val.data.boolean) return false;
                     }
                 }
@@ -771,7 +771,7 @@ pub const Executor = struct {
                 for (dir.arguments.items) |arg| {
                     if (std.mem.eql(u8, arg.name, "if")) {
                         var val = try self.coerceValue(arg.value);
-                        defer val.deinit();
+                        defer val.deinit(self.allocator);
                         if (val.data == .boolean and !val.data.boolean) return false;
                     }
                 }
@@ -911,7 +911,7 @@ pub const Executor = struct {
             var aiter = args.iterator();
             while (aiter.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit();
+                entry.value_ptr.deinit(self.allocator);
             }
             args.deinit();
         }
@@ -921,7 +921,7 @@ pub const Executor = struct {
             const arg_key = try self.allocator.dupe(u8, arg.name);
             errdefer self.allocator.free(arg_key);
             args.put(arg_key, arg_value) catch |err| {
-                arg_value.deinit();
+                arg_value.deinit(self.allocator);
                 self.allocator.free(arg_key);
                 return err;
             };
@@ -932,11 +932,11 @@ pub const Executor = struct {
         while (def_iter.next()) |entry| {
             if (args.contains(entry.key_ptr.*)) continue;
             if (entry.value_ptr.default_value) |dv| {
-                var default_clone = try dv.clone();
-                errdefer default_clone.deinit();
+                var default_clone = try dv.clone(self.allocator);
+                errdefer default_clone.deinit(self.allocator);
                 const key = try self.allocator.dupe(u8, entry.key_ptr.*);
                 args.put(key, default_clone) catch |err| {
-                    default_clone.deinit();
+                    default_clone.deinit(self.allocator);
                     self.allocator.free(key);
                     return err;
                 };
@@ -976,14 +976,14 @@ pub const Executor = struct {
                 const child_path = try self.dupePath(path, field.name);
                 defer self.freePath(child_path);
                 const result = self.executeSubSelection(fss, field_def.?.*, resolved, child_path) catch |err| {
-                    resolved.deinit();
+                    resolved.deinit(self.allocator);
                     had_error = true;
                     if (field_def.?.field_type.isNonNull()) {
                         return err; // bubble up
                     }
                     return Value.fromNull(self.allocator);
                 };
-                resolved.deinit();
+                resolved.deinit(self.allocator);
                 return result;
             }
             return resolved;
@@ -1009,7 +1009,7 @@ pub const Executor = struct {
         // Scalar field without resolver: extract from parent object
         if (parent_value.data == .object) {
             if (parent_value.data.object.get(field.name)) |v| {
-                const result = try v.clone();
+                const result = try v.clone(self.allocator);
                 return result;
             }
         }
@@ -1020,7 +1020,7 @@ pub const Executor = struct {
         switch (val) {
             .variable => |name| {
                 if (self.context.variables.get(name)) |v| {
-                    return try v.clone();
+                    return try v.clone(self.allocator);
                 }
                 return Value.fromNull(self.allocator);
             },
@@ -1040,7 +1040,7 @@ pub const Executor = struct {
             .enum_value => |text| return Value.fromEnum(self.allocator, try self.allocator.dupe(u8, text)),
             .list_value => |list| {
                 var result = Value.initList(self.allocator);
-                errdefer result.deinit();
+                errdefer result.deinit(self.allocator);
                 for (list.items) |item| {
                     try result.data.list.append(try self.coerceValue(item));
                 }
@@ -1048,7 +1048,7 @@ pub const Executor = struct {
             },
             .object_value => |obj| {
                 var result = Value.initObject(self.allocator);
-                errdefer result.deinit();
+                errdefer result.deinit(self.allocator);
                 var iter = obj.iterator();
                 while (iter.next()) |entry| {
                     try result.data.object.put(try self.allocator.dupe(u8, entry.key_ptr.*), try self.coerceValue(entry.value_ptr.*));
@@ -1093,7 +1093,7 @@ test "executor basic" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expectEqualStrings("world", result.data.object.get("data").?.data.object.get("hello").?.data.string);
 }
@@ -1150,7 +1150,7 @@ test "executor with fragment spread" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const data = result.data.object.get("data").?.data.object;
     const user_obj = data.get("user").?.data.object;
@@ -1201,7 +1201,7 @@ test "executor field error returns partial data" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const data = result.data.object.get("data").?.data.object;
     try std.testing.expectEqualStrings("yes", data.get("ok").?.data.string);
@@ -1256,11 +1256,11 @@ test "executor operationName selection" {
     defer executor.deinit();
 
     var result_a = try executor.executeNamed(&doc, "OpA");
-    defer result_a.deinit();
+    defer result_a.deinit(allocator);
     try std.testing.expectEqualStrings("A", result_a.data.object.get("data").?.data.object.get("a").?.data.string);
 
     var result_b = try executor.executeNamed(&doc, "OpB");
-    defer result_b.deinit();
+    defer result_b.deinit(allocator);
     try std.testing.expectEqualStrings("B", result_b.data.object.get("data").?.data.object.get("b").?.data.string);
 }
 
@@ -1317,7 +1317,7 @@ test "executor inline fragment with type condition" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const data = result.data.object.get("data").?.data.object;
     const user_obj = data.get("user").?.data.object;
@@ -1366,7 +1366,7 @@ test "executor variables substitution" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }
@@ -1374,7 +1374,7 @@ test "executor variables substitution" {
     try executor.setVariables(variables);
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const data = result.data.object.get("data").?.data.object;
     try std.testing.expectEqualStrings("Hello, World!", data.get("greet").?.data.string);
@@ -1426,7 +1426,7 @@ test "executor hooks" {
     executor.context.user_data = &hook_called;
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expect(hook_called);
 }
@@ -1504,7 +1504,7 @@ test "executor subscription stream" {
     var expected: i64 = 0;
     while (true) {
         var event = try stream.next(allocator) orelse break;
-        defer event.deinit();
+        defer event.deinit(allocator);
 
         try std.testing.expect(event.data == .object);
         const data = event.data.object.get("data") orelse {
@@ -1588,7 +1588,7 @@ test "executor subscription cancel" {
     var event = try stream.next(allocator) orelse {
         return error.TestUnexpectedResult;
     };
-    defer event.deinit();
+    defer event.deinit(allocator);
     try std.testing.expect(event.data == .object);
 
     // Cancel the stream
@@ -1631,7 +1631,7 @@ test "executor @skip directive" {
         var vit = vars1.iterator();
         while (vit.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         vars1.deinit();
     }
@@ -1644,7 +1644,7 @@ test "executor @skip directive" {
     defer doc1.deinit();
 
     var result1 = try executor1.execute(&doc1);
-    defer result1.deinit();
+    defer result1.deinit(allocator);
     const data1 = result1.data.object.get("data") orelse return error.TestUnexpectedResult;
     try std.testing.expect(data1.data.object.get("hello") == null);
 
@@ -1656,7 +1656,7 @@ test "executor @skip directive" {
         var vit = vars2.iterator();
         while (vit.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         vars2.deinit();
     }
@@ -1669,7 +1669,7 @@ test "executor @skip directive" {
     defer doc2.deinit();
 
     var result2 = try executor2.execute(&doc2);
-    defer result2.deinit();
+    defer result2.deinit(allocator);
     const data2 = result2.data.object.get("data") orelse return error.TestUnexpectedResult;
     const hello2 = data2.data.object.get("hello") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.eql(u8, hello2.data.string, "world"));
@@ -1707,7 +1707,7 @@ test "executor @skip directive direct selection set" {
         var vit = vars.iterator();
         while (vit.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         vars.deinit();
     }
@@ -1723,7 +1723,7 @@ test "executor @skip directive direct selection set" {
     switch (def.*) {
         .operation => |*op| {
             var result = try executor.executeSelectionSet(&op.selection_set, query_type, Value.fromNull(allocator));
-            defer result.deinit();
+            defer result.deinit(allocator);
             const hello = result.data.object.get("hello") orelse return error.TestUnexpectedResult;
             try std.testing.expect(std.mem.eql(u8, hello.data.string, "world"));
         },
@@ -1763,7 +1763,7 @@ test "executor @include directive" {
         var vit = vars1.iterator();
         while (vit.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         vars1.deinit();
     }
@@ -1776,7 +1776,7 @@ test "executor @include directive" {
     defer doc1.deinit();
 
     var result1 = try executor1.execute(&doc1);
-    defer result1.deinit();
+    defer result1.deinit(allocator);
     const data1 = result1.data.object.get("data") orelse return error.TestUnexpectedResult;
     try std.testing.expect(data1.data.object.get("hello") == null);
 
@@ -1788,7 +1788,7 @@ test "executor @include directive" {
         var vit = vars2.iterator();
         while (vit.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         vars2.deinit();
     }
@@ -1801,7 +1801,7 @@ test "executor @include directive" {
     defer doc2.deinit();
 
     var result2 = try executor2.execute(&doc2);
-    defer result2.deinit();
+    defer result2.deinit(allocator);
     const data2 = result2.data.object.get("data") orelse return error.TestUnexpectedResult;
     const hello2 = data2.data.object.get("hello") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.eql(u8, hello2.data.string, "world"));
@@ -1837,7 +1837,7 @@ test "executor __typename from schema type" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const data = result.data.object.get("data").?.data.object;
     try std.testing.expectEqualStrings("Query", data.get("__typename").?.data.string);
@@ -1880,7 +1880,7 @@ test "executor __typename from runtime value" {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     const node = result.data.object.get("data").?.data.object.get("node").?.data.object;
     try std.testing.expectEqualStrings("User", node.get("__typename").?.data.string);
@@ -1934,12 +1934,12 @@ test "executor mutation end-to-end" {
 
     // Executing twice must run the mutation resolver twice (side effects applied).
     var result1 = try executor.execute(&doc);
-    defer result1.deinit();
+    defer result1.deinit(allocator);
     const inc1 = result1.data.object.get("data").?.data.object.get("increment").?.data.int;
     try std.testing.expectEqual(@as(i64, 1), inc1);
 
     var result2 = try executor.execute(&doc);
-    defer result2.deinit();
+    defer result2.deinit(allocator);
     const inc2 = result2.data.object.get("data").?.data.object.get("increment").?.data.int;
     try std.testing.expectEqual(@as(i64, 2), inc2);
 }
@@ -2010,7 +2010,7 @@ test "executor default variables do not leak across executions" {
         var doc = try parser.parseDocument();
         defer doc.deinit();
         var result = try executor.execute(&doc);
-        defer result.deinit();
+        defer result.deinit(allocator);
         const data = result.data.object.get("data").?;
         const greeting = data.data.object.get("greeting").?;
         try std.testing.expectEqualStrings("world", greeting.data.string);
@@ -2021,7 +2021,7 @@ test "executor default variables do not leak across executions" {
         var doc = try parser.parseDocument();
         defer doc.deinit();
         var result = try executor.execute(&doc);
-        defer result.deinit();
+        defer result.deinit(allocator);
         const data = result.data.object.get("data").?;
         const greeting = data.data.object.get("greeting").?;
         try std.testing.expectEqualStrings("world", greeting.data.string);
@@ -2115,7 +2115,7 @@ test "executor subscription receives user_data as ctx" {
 
     const event_val = (try stream.next(allocator)) orelse return error.TestUnexpectedResult;
     var event = event_val;
-    defer event.deinit();
+    defer event.deinit(allocator);
     try std.testing.expect(user_data.seen_ctx);
 }
 
@@ -2164,7 +2164,7 @@ test "executor OOM: every allocation failure is handled" {
             defer doc.deinit();
 
             var result = try executor.execute(&doc);
-            result.deinit();
+            result.deinit(allocator);
         }
     }.impl;
     try std.testing.checkAllAllocationFailures(allocator, run, .{});

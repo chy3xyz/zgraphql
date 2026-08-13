@@ -68,9 +68,9 @@ pub fn main() !void {
     defer doc.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
-    const json_str = try result.toJson();
+    const json_str = try result.toJson(allocator);
     defer allocator.free(json_str);
 
     std.debug.print("query: {s}\n", .{query});

@@ -124,7 +124,7 @@ fn benchExecute(allocator: std.mem.Allocator, io: Io) !void {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 }
 
 fn benchEndToEnd(allocator: std.mem.Allocator, io: Io) !void {
@@ -145,9 +145,9 @@ fn benchEndToEnd(allocator: std.mem.Allocator, io: Io) !void {
     defer executor.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
-    const json_str = try result.toJson();
+    const json_str = try result.toJson(allocator);
     defer allocator.free(json_str);
 }
 

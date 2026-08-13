@@ -59,7 +59,7 @@ pub fn main() !void {
     std.debug.print("Loading {d} users...\n", .{user_ids.len});
     const users = try dl.loadMany(user_ids);
     defer {
-        for (users) |*user| user.deinit();
+        for (users) |*user| user.deinit(allocator);
         allocator.free(users);
     }
 
@@ -74,7 +74,7 @@ pub fn main() !void {
     const cached = try dl.load("1");
     defer if (cached) |c| {
         var owned = c;
-        owned.deinit();
+        owned.deinit(allocator);
     };
     std.debug.print("\nCache hit for '1': {s}\n", .{if (cached != null) "yes" else "no"});
 
@@ -83,7 +83,7 @@ pub fn main() !void {
     std.debug.print("\nLoading {d} more users (some already cached)...\n", .{more_ids.len});
     const more = try dl.loadMany(more_ids);
     defer {
-        for (more) |*user| user.deinit();
+        for (more) |*user| user.deinit(allocator);
         allocator.free(more);
     }
     for (more, 0..) |user, i| {

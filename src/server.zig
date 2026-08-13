@@ -29,6 +29,8 @@ const zg = struct {
 const Schema = zg.schema.Schema;
 const Value = zg.Value;
 const playground = @import("server_playground.zig");
+const apq = @import("server_apq.zig");
+const ws_handlers = @import("server_ws.zig");
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
@@ -419,7 +421,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         }
         var ws = try request.respondWebSocket(.{ .key = key, .extra_headers = ws_extra[0..ws_extra_count] });
         try ws.output.flush();
-        try handleWebSocket(self, io, &ws);
+        try ws_handlers.handleWebSocket(self, io, &ws);
         had_error = false;
         return;
     }
@@ -525,7 +527,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         variables.deinit();
     }
@@ -596,7 +598,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
                         if (apq_hash) |h| {
                             if (h == .string) {
                                 const sig: ?[]const u8 = if (apq_sig) |s| (if (s == .string) s.string else null) else null;
-                                query_str = try resolvePersistedQuery(self, request, h.string, query_str, sig, origin);
+                                query_str = try apq.resolvePersistedQuery(self, request, h.string, query_str, sig, origin);
                                 if (query_str == null) return;
                             }
                         }
@@ -639,7 +641,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
                                 if (apq_hash) |h| {
                                     if (h == .string) {
                                         const sig: ?[]const u8 = if (apq_sig) |s| (if (s == .string) s.string else null) else null;
-                                        query_str = try resolvePersistedQuery(self, request, h.string, query_str, sig, origin);
+                                        query_str = try apq.resolvePersistedQuery(self, request, h.string, query_str, sig, origin);
                                         if (query_str == null) return;
                                     }
                                 }
@@ -731,7 +733,7 @@ fn isKeyword(s: []const u8, kw: []const u8) bool {
 
 /// Execute a GraphQL query string and return the JSON response.
 /// Caller owns the returned json_str memory.
-fn executeGraphQLAndGetJson(
+pub fn executeGraphQLAndGetJson(
     self: *GraphQLServer,
     io: Io,
     query: []const u8,
@@ -861,19 +863,19 @@ fn executeGraphQLAndGetJson(
 
     if (!validation_result.isValid()) {
         var error_json = Value.initObject(self.allocator);
-        defer error_json.deinit();
+        defer error_json.deinit(self.allocator);
         var errors = Value.initList(self.allocator);
-        errdefer errors.deinit();
+        errdefer errors.deinit(self.allocator);
         for (validation_result.errors.items) |err| {
             var err_obj = Value.initObject(self.allocator);
-            errdefer err_obj.deinit();
+            errdefer err_obj.deinit(self.allocator);
             try err_obj.data.object.put(try self.allocator.dupe(u8, "message"), Value.fromString(self.allocator, try self.allocator.dupe(u8, err.message)));
             if (err.line != null or err.col != null) {
                 var loc = Value.initObject(self.allocator);
                 // Ownership of loc transfers to `locations` on append below;
                 // the loc errdefer is only active until that point.
                 var loc_owned = true;
-                errdefer if (loc_owned) loc.deinit();
+                errdefer if (loc_owned) loc.deinit(self.allocator);
                 if (err.line) |line| {
                     try loc.data.object.put(try self.allocator.dupe(u8, "line"), Value.fromInt(self.allocator, @intCast(line)));
                 }
@@ -881,7 +883,7 @@ fn executeGraphQLAndGetJson(
                     try loc.data.object.put(try self.allocator.dupe(u8, "column"), Value.fromInt(self.allocator, @intCast(col)));
                 }
                 var locations = Value.initList(self.allocator);
-                errdefer locations.deinit();
+                errdefer locations.deinit(self.allocator);
                 try locations.data.list.append(loc);
                 loc_owned = false;
                 try err_obj.data.object.put(try self.allocator.dupe(u8, "locations"), locations);
@@ -889,7 +891,7 @@ fn executeGraphQLAndGetJson(
             try errors.data.list.append(err_obj);
         }
         try error_json.data.object.put(try self.allocator.dupe(u8, "errors"), errors);
-        const json_str = error_json.toJson() catch |err| {
+        const json_str = error_json.toJson(self.allocator) catch |err| {
             log.err("json error: {s}", .{@errorName(err)});
             return error.OutOfMemory;
         };
@@ -921,9 +923,9 @@ fn executeGraphQLAndGetJson(
             .had_error = true,
         };
     };
-    defer result.deinit();
+    defer result.deinit(self.allocator);
 
-    const json_str = result.toJson() catch |err| {
+    const json_str = result.toJson(self.allocator) catch |err| {
         log.err("json serialization error: {s}", .{@errorName(err)});
         return error.OutOfMemory;
     };
@@ -949,7 +951,7 @@ fn executeGraphQLAndGetJson(
     return .{ .json_str = json_str, .complexity = complexity, .had_error = false };
 }
 
-fn buildErrorJson(allocator: std.mem.Allocator, message: []const u8) ![]const u8 {
+pub fn buildErrorJson(allocator: std.mem.Allocator, message: []const u8) ![]const u8 {
     const ErrorPayload = struct {
         errors: []const struct { message: []const u8 },
     };
@@ -957,7 +959,7 @@ fn buildErrorJson(allocator: std.mem.Allocator, message: []const u8) ![]const u8
     return try std.json.Stringify.valueAlloc(allocator, payload, .{});
 }
 
-fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) std.mem.Allocator.Error!Value {
+pub fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) std.mem.Allocator.Error!Value {
     switch (json_val) {
         .null => return Value.fromNull(allocator),
         .bool => |b| return Value.fromBool(allocator, b),
@@ -977,7 +979,7 @@ fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) st
         .string => |s| return Value.fromString(allocator, try allocator.dupe(u8, s)),
         .array => |arr| {
             var list = Value.initList(allocator);
-            errdefer list.deinit();
+            errdefer list.deinit(allocator);
             for (arr.items) |item| {
                 try list.data.list.append(try jsonToGraphQLValue(allocator, item));
             }
@@ -985,7 +987,7 @@ fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) st
         },
         .object => |obj| {
             var graph_obj = Value.initObject(allocator);
-            errdefer graph_obj.deinit();
+            errdefer graph_obj.deinit(allocator);
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 try graph_obj.data.object.put(try allocator.dupe(u8, entry.key_ptr.*), try jsonToGraphQLValue(allocator, entry.value_ptr.*));
@@ -1092,135 +1094,6 @@ fn sendPlayground(request: *http.Server.Request, origin: []const u8) !void {
     });
 }
 
-/// Verify an APQ signature using HMAC-SHA256.
-/// `signature` must be a lower-case hex string of the HMAC.
-/// Returns true if the signature is valid or no secret is configured.
-fn verifyApqSignature(secret: ?[]const u8, hash: []const u8, signature: ?[]const u8) bool {
-    const s = secret orelse return true;
-    const sig = signature orelse return false;
-
-    var mac_bytes: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_bytes, hash, s);
-    const expected_hex = std.fmt.bytesToHex(mac_bytes, .lower);
-
-    if (sig.len != expected_hex.len) return false;
-    var diff: u8 = 0;
-    for (sig, expected_hex) |a, b| {
-        diff |= a ^ b;
-    }
-    return diff == 0;
-}
-
-/// Resolve an APQ (Automatic Persisted Query) hash.
-/// Returns an owned query string to execute, or null if an error response was already sent.
-/// Caller owns the returned string (if non-null) and must free it.
-///
-/// Ownership contract: `provided_query` must be owned by the caller. This
-/// function takes ownership: on success it either returns `provided_query`
-/// itself (transferring ownership back) or returns a fresh owned copy; on
-/// business failure (returning null) it frees `provided_query`. On error
-/// propagation (an error is returned) `provided_query` is NOT freed — the
-/// caller's own cleanup (e.g. a deferred free) remains responsible for it.
-fn resolvePersistedQuery(self: *GraphQLServer, request: *http.Server.Request, hash: []const u8, provided_query: ?[]const u8, signature: ?[]const u8, origin: []const u8) !?[]const u8 {
-    if (!verifyApqSignature(self.options.apq_hmac_secret, hash, signature)) {
-        try sendGraphQLErrorResponse(self.allocator, request, "PersistedQuery.InvalidSignature", .bad_request, origin);
-        if (provided_query) |q| self.allocator.free(q);
-        return null;
-    }
-
-    const cache = self.options.query_cache orelse {
-        // No cache configured; if whitelist is on, reject
-        if (self.options.enforce_query_whitelist) {
-            try sendGraphQLErrorResponse(self.allocator, request, "PersistedQueryNotFound", .ok, origin);
-            if (provided_query) |q| self.allocator.free(q);
-            return null;
-        }
-        return provided_query;
-    };
-
-    // Cache hit: getInsensitive returns an owned copy. The caller frees it.
-    if (cache.getInsensitive(hash)) |cached_query| {
-        if (provided_query) |q| self.allocator.free(q);
-        return cached_query;
-    }
-
-    if (provided_query) |query| {
-        // Verify the hash matches the provided query (case-insensitive)
-        const computed = try zg.QueryCache.computeHash(self.allocator, query);
-        defer self.allocator.free(computed);
-        const hash_match = std.mem.eql(u8, computed, hash) or blk: {
-            const lower_hash = try self.allocator.alloc(u8, hash.len);
-            defer self.allocator.free(lower_hash);
-            _ = std.ascii.lowerString(lower_hash, hash);
-            break :blk std.mem.eql(u8, computed, lower_hash);
-        };
-        if (!hash_match) {
-            try sendGraphQLErrorResponse(self.allocator, request, "Provided sha does not match query", .bad_request, origin);
-            self.allocator.free(query);
-            return null;
-        }
-
-        // In whitelist mode, don't auto-register new queries
-        if (!self.options.enforce_query_whitelist) {
-            try cache.store(query);
-        }
-        return query;
-    }
-
-    // Hash not found and no query provided
-    try sendGraphQLErrorResponse(self.allocator, request, "PersistedQueryNotFound", .ok, origin);
-    return null;
-}
-
-/// Batch-safe variant of resolvePersistedQuery that does not send HTTP responses.
-/// Returns null on any APQ failure (caller should produce a GraphQL error JSON).
-///
-/// Ownership contract (same as resolvePersistedQuery): `provided_query` must be
-/// owned by the caller. On success this returns an owned string (either
-/// `provided_query` itself or a fresh copy); on failure it frees
-/// `provided_query` and returns null.
-fn resolvePersistedQueryBatch(self: *GraphQLServer, hash: []const u8, provided_query: ?[]const u8, signature: ?[]const u8) !?[]const u8 {
-    if (!verifyApqSignature(self.options.apq_hmac_secret, hash, signature)) {
-        if (provided_query) |q| self.allocator.free(q);
-        return null;
-    }
-
-    const cache = self.options.query_cache orelse {
-        if (self.options.enforce_query_whitelist) {
-            if (provided_query) |q| self.allocator.free(q);
-            return null;
-        }
-        return provided_query;
-    };
-
-    if (cache.getInsensitive(hash)) |cached_query| {
-        if (provided_query) |q| self.allocator.free(q);
-        return cached_query;
-    }
-
-    if (provided_query) |query| {
-        const computed = try zg.QueryCache.computeHash(self.allocator, query);
-        defer self.allocator.free(computed);
-        const hash_match = std.mem.eql(u8, computed, hash) or blk: {
-            const lower_hash = try self.allocator.alloc(u8, hash.len);
-            defer self.allocator.free(lower_hash);
-            _ = std.ascii.lowerString(lower_hash, hash);
-            break :blk std.mem.eql(u8, computed, lower_hash);
-        };
-        if (!hash_match) {
-            self.allocator.free(query);
-            return null;
-        }
-
-        if (!self.options.enforce_query_whitelist) {
-            try cache.store(query);
-        }
-        return query;
-    }
-
-    return null;
-}
-
 /// Execute a batch of GraphQL requests (Apollo-style array payload).
 /// Returns a JSON array string. Caller owns the returned json_str memory.
 fn executeBatch(
@@ -1272,7 +1145,7 @@ fn executeBatch(
         var batch_variables = std.StringHashMap(Value).init(self.allocator);
         defer {
             var vit = batch_variables.valueIterator();
-            while (vit.next()) |v| v.deinit();
+            while (vit.next()) |v| v.deinit(self.allocator);
             batch_variables.deinit();
         }
 
@@ -1295,7 +1168,7 @@ fn executeBatch(
                         if (apq_hash) |h| {
                             if (h == .string) {
                                 const sig: ?[]const u8 = if (apq_sig) |s| (if (s == .string) s.string else null) else null;
-                                batch_query_str = try resolvePersistedQueryBatch(self, h.string, batch_query_str, sig);
+                                batch_query_str = try apq.resolvePersistedQueryBatch(self, h.string, batch_query_str, sig);
                                 if (batch_query_str == null) {
                                     const err_json = try buildErrorJson(self.allocator, "PersistedQueryNotFound");
                                     try results.append(err_json);
@@ -1348,7 +1221,7 @@ fn executeBatch(
     };
 }
 
-fn sendGraphQLErrorResponse(allocator: std.mem.Allocator, request: *http.Server.Request, message: []const u8, status: std.http.Status, origin: []const u8) !void {
+pub fn sendGraphQLErrorResponse(allocator: std.mem.Allocator, request: *http.Server.Request, message: []const u8, status: std.http.Status, origin: []const u8) !void {
     // Use std.json to safely escape the message and prevent JSON injection
     const ErrorPayload = struct {
         errors: []const struct { message: []const u8 },
@@ -1365,379 +1238,6 @@ fn sendGraphQLErrorResponse(allocator: std.mem.Allocator, request: *http.Server.
         .status = status,
         .extra_headers = &headers,
     });
-}
-
-fn readPayloadLen(in: *std.Io.Reader, h1: std.http.Server.WebSocket.Header1) !usize {
-    return switch (h1.payload_len) {
-        .len16 => try in.takeInt(u16, .big),
-        .len64 => std.math.cast(usize, try in.takeInt(u64, .big)) orelse return error.MessageOversize,
-        else => @intFromEnum(h1.payload_len),
-    };
-}
-
-/// Read a WebSocket message, supporting fragmented frames and payloads larger
-/// than the input buffer. Caller owns the returned memory.
-fn readWebSocketMessage(allocator: std.mem.Allocator, ws: *http.Server.WebSocket, max_size: usize) !?[]u8 {
-    const in = ws.input;
-
-    var opcode: ?std.http.Server.WebSocket.Opcode = null;
-    var buf = std.array_list.Managed(u8).init(allocator);
-    errdefer buf.deinit();
-
-    while (true) {
-        const header = try in.takeArray(2);
-        const h0: std.http.Server.WebSocket.Header0 = @bitCast(header[0]);
-        const h1: std.http.Server.WebSocket.Header1 = @bitCast(header[1]);
-
-        switch (h0.opcode) {
-            .text, .binary, .pong, .ping => {},
-            .connection_close => return error.ConnectionClose,
-            .continuation => {},
-            _ => return error.UnexpectedOpCode,
-        }
-
-        if (!h1.mask) return error.MissingMaskBit;
-
-        const plen = try readPayloadLen(in, h1);
-        const mask: u32 = @bitCast((try in.takeArray(4)).*);
-
-        // Handle control frames inline
-        if (h0.opcode == .ping) {
-            const ping_buf = try allocator.alloc(u8, plen);
-            defer allocator.free(ping_buf);
-            try in.readSliceAll(ping_buf);
-            try ws.writeMessage(ping_buf, .pong);
-            continue;
-        }
-        if (h0.opcode == .pong) {
-            const pong_buf = try allocator.alloc(u8, plen);
-            defer allocator.free(pong_buf);
-            try in.readSliceAll(pong_buf);
-            continue;
-        }
-
-        // Read payload
-        var payload: []u8 = undefined;
-        var owned = false;
-        if (plen > in.buffer.len) {
-            payload = try allocator.alloc(u8, plen);
-            owned = true;
-            try in.readSliceAll(payload);
-        } else {
-            payload = try in.take(plen);
-        }
-
-        // Unmask payload
-        const floored_len = (payload.len / 4) * 4;
-        const u32_payload: []align(1) u32 = @ptrCast(payload[0..floored_len]);
-        for (u32_payload) |*elem| elem.* ^= mask;
-        const mask_bytes: []const u8 = @ptrCast(&mask);
-        for (payload[floored_len..], mask_bytes[0 .. payload.len - floored_len]) |*leftover, m|
-            leftover.* ^= m;
-
-        if (opcode == null) {
-            if (h0.opcode == .continuation) return error.UnexpectedOpCode;
-            opcode = h0.opcode;
-        }
-
-        try buf.appendSlice(payload);
-        if (buf.items.len > max_size) {
-            if (owned) allocator.free(payload);
-            return error.MessageTooLarge;
-        }
-        if (owned) allocator.free(payload);
-
-        if (h0.fin) break;
-    }
-
-    if (buf.items.len == 0) return null;
-    return try allocator.dupe(u8, buf.items);
-}
-
-const ActiveSubscription = struct {
-    stream: zg.schema.SubscriptionStream,
-    future: Io.Future(Io.Cancelable!void),
-    id: []const u8,
-};
-
-/// Consume a subscription stream in a concurrent task, sending events over WebSocket.
-fn consumeSubscription(
-    self: *GraphQLServer,
-    io: Io,
-    ws: *http.Server.WebSocket,
-    ws_mutex: *std.Io.Mutex,
-    stream: zg.schema.SubscriptionStream,
-    id: []const u8,
-) Io.Cancelable!void {
-    defer stream.deinit(self.allocator);
-    while (true) {
-        io.checkCancel() catch return;
-
-        var event = stream.next(self.allocator) catch |err| {
-            log.err("subscription stream error: {s}", .{@errorName(err)});
-            const err_json = buildErrorJson(self.allocator, "Subscription stream error") catch break;
-            defer self.allocator.free(err_json);
-            const response = std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json }) catch break;
-            defer self.allocator.free(response);
-            ws_mutex.lock(io) catch break;
-            defer ws_mutex.unlock(io);
-            ws.writeMessage(response, .text) catch |werr| {
-                log.err("websocket write error (subscription error): {s}", .{@errorName(werr)});
-            };
-            break;
-        } orelse break;
-        defer event.deinit();
-
-        const json_str = event.toJson() catch {
-            log.err("subscription json serialization failed", .{});
-            break;
-        };
-        defer self.allocator.free(json_str);
-
-        const response = std.fmt.allocPrint(self.allocator, "{{\"type\":\"next\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, json_str }) catch break;
-        defer self.allocator.free(response);
-
-        ws_mutex.lock(io) catch break;
-        defer ws_mutex.unlock(io);
-        ws.writeMessage(response, .text) catch |werr| {
-            log.err("websocket write error (subscription next): {s}", .{@errorName(werr)});
-        };
-    }
-
-    // Send complete
-    const complete_response = std.fmt.allocPrint(self.allocator, "{{\"type\":\"complete\",\"id\":\"{s}\"}}", .{id}) catch return;
-    defer self.allocator.free(complete_response);
-    ws_mutex.lock(io) catch return;
-    defer ws_mutex.unlock(io);
-    ws.writeMessage(complete_response, .text) catch |werr| {
-        log.err("websocket write error (subscription complete): {s}", .{@errorName(werr)});
-    };
-
-}
-
-/// Handle WebSocket connection using graphql-ws protocol.
-fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket) !void {
-    // Wait for connection_init
-    const init_msg_data = readWebSocketMessage(self.allocator, ws, self.options.max_websocket_message_size) catch |err| switch (err) {
-        error.ConnectionClose => return,
-        else => {
-            log.err("websocket read error: {s}", .{@errorName(err)});
-            return;
-        },
-    };
-    defer if (init_msg_data) |d| self.allocator.free(d);
-
-    // Parse connection_init
-    const init_parsed = std.json.parseFromSlice(std.json.Value, self.allocator, init_msg_data orelse "{}", .{}) catch {
-        try ws.writeMessage("{\"type\":\"connection_error\"}", .text);
-        return;
-    };
-    defer init_parsed.deinit();
-
-    const msg_type_ok = if (init_parsed.value.object.get("type")) |t| t == .string and std.mem.eql(u8, t.string, "connection_init") else false;
-    if (init_parsed.value != .object or !msg_type_ok) {
-        try ws.writeMessage("{\"type\":\"connection_error\"}", .text);
-        return;
-    }
-
-    // Send connection_ack
-    try ws.writeMessage("{\"type\":\"connection_ack\"}", .text);
-
-    var ws_mutex = std.Io.Mutex.init;
-    var active_subs = std.StringHashMap(ActiveSubscription).init(self.allocator);
-    defer {
-        // Cancel all active subscriptions on disconnect and await completion
-        var iter = active_subs.iterator();
-        while (iter.next()) |entry| {
-            entry.value_ptr.stream.cancel();
-            _ = entry.value_ptr.future.cancel(io) catch {};
-            _ = entry.value_ptr.future.await(io) catch {};
-            self.allocator.free(entry.value_ptr.id);
-        }
-        active_subs.deinit();
-    }
-
-    // Message loop
-    while (true) {
-        const msg_data = readWebSocketMessage(self.allocator, ws, self.options.max_websocket_message_size) catch |err| switch (err) {
-            error.ConnectionClose => return,
-            else => {
-                log.err("websocket read error: {s}", .{@errorName(err)});
-                return;
-            },
-        };
-        defer if (msg_data) |d| self.allocator.free(d);
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, msg_data orelse "{}", .{}) catch continue;
-        defer parsed.deinit();
-
-        if (parsed.value != .object) continue;
-        const obj = parsed.value.object;
-        const msg_type = if (obj.get("type")) |t| (if (t == .string) t.string else continue) else continue;
-
-        if (std.mem.eql(u8, msg_type, "ping")) {
-            try ws.writeMessage("{\"type\":\"pong\"}", .text);
-            continue;
-        }
-
-        if (std.mem.eql(u8, msg_type, "subscribe")) {
-            const id = if (obj.get("id")) |id_val| (if (id_val == .string) id_val.string else "") else "";
-            const payload = if (obj.get("payload")) |p| (if (p == .object) p else continue) else continue;
-
-            var query_str: ?[]const u8 = null;
-            var operation_name: ?[]const u8 = null;
-            var variables = std.StringHashMap(Value).init(self.allocator);
-            defer {
-                var viter = variables.iterator();
-                while (viter.next()) |entry| {
-                    self.allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.deinit();
-                }
-                variables.deinit();
-            }
-
-            if (payload.object.get("query")) |q| {
-                if (q == .string) query_str = q.string;
-            }
-            if (payload.object.get("operationName")) |op| {
-                if (op == .string) operation_name = op.string;
-            }
-            if (payload.object.get("variables")) |vars| {
-                if (vars == .object) {
-                    var viter = vars.object.iterator();
-                    while (viter.next()) |entry| {
-                        try variables.put(try self.allocator.dupe(u8, entry.key_ptr.*), try jsonToGraphQLValue(self.allocator, entry.value_ptr.*));
-                    }
-                }
-            }
-
-            const query = query_str orelse {
-                const err_json = try buildErrorJson(self.allocator, "Missing query");
-                defer self.allocator.free(err_json);
-                const response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json });
-                defer self.allocator.free(response);
-                try ws.writeMessage(response, .text);
-                continue;
-            };
-
-            // Parse document to determine operation type
-            var parser = zg.Parser.init(self.allocator, query) catch |err| {
-                log.err("websocket parser init error: {s}", .{@errorName(err)});
-                const err_json = try buildErrorJson(self.allocator, "Parser error");
-                defer self.allocator.free(err_json);
-                const response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json });
-                defer self.allocator.free(response);
-                try ws.writeMessage(response, .text);
-                continue;
-            };
-            defer parser.deinit();
-            var doc = parser.parseDocument() catch |err| {
-                log.err("websocket parse error: {s}", .{@errorName(err)});
-                const err_json = try buildErrorJson(self.allocator, "Syntax error");
-                defer self.allocator.free(err_json);
-                const response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json });
-                defer self.allocator.free(response);
-                try ws.writeMessage(response, .text);
-                continue;
-            };
-            defer doc.deinit();
-
-            // Detect subscription operation
-            var is_subscription = false;
-            for (doc.definitions.items) |*def| {
-                switch (def.*) {
-                    .operation => |*op| {
-                        if (operation_name) |name| {
-                            if (op.name != null and std.mem.eql(u8, op.name.?, name)) {
-                                is_subscription = op.op_type == .subscription;
-                                break;
-                            }
-                        } else {
-                            if (!is_subscription) {
-                                is_subscription = op.op_type == .subscription;
-                            }
-                        }
-                    },
-                    else => {},
-                }
-            }
-
-            if (is_subscription) {
-                // Cancel any existing subscription with the same ID
-                if (active_subs.getPtr(id)) |existing| {
-                    existing.stream.cancel();
-                    _ = existing.future.cancel(io) catch {};
-                    // Await to ensure the future finishes before we free its resources
-                    _ = existing.future.await(io) catch {};
-                    self.allocator.free(existing.id);
-                    _ = active_subs.remove(id);
-                }
-
-                var executor = zg.Executor.init(self.allocator, self.schema_def, io);
-                defer executor.deinit();
-                try executor.setVariables(variables);
-                if (self.options.hooks) |hooks| executor.hooks = hooks;
-                if (self.options.user_data) |user_data| executor.setUserData(user_data);
-
-                var stream = executor.executeSubscription(&doc) catch |err| {
-                    log.err("websocket subscription error: {s}", .{@errorName(err)});
-                    const err_json = try buildErrorJson(self.allocator, "Subscription error");
-                    defer self.allocator.free(err_json);
-                    const response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json });
-                    defer self.allocator.free(response);
-                    try ws.writeMessage(response, .text);
-                    continue;
-                };
-                errdefer stream.deinit(self.allocator);
-
-                const id_copy = try self.allocator.dupe(u8, id);
-                errdefer self.allocator.free(id_copy);
-
-                const future = try Io.concurrent(io, consumeSubscription, .{ self, io, ws, &ws_mutex, stream, id_copy });
-
-                try active_subs.put(id_copy, .{
-                    .stream = stream,
-                    .future = future,
-                    .id = id_copy,
-                });
-                continue;
-            }
-
-            // Non-subscription: single-shot execution
-            const result = executeGraphQLAndGetJson(self, io, query, operation_name, &variables, null) catch |err| {
-                log.err("websocket execution error: {s}", .{@errorName(err)});
-                const err_json = try buildErrorJson(self.allocator, "Internal error");
-                defer self.allocator.free(err_json);
-                const response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"error\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, err_json });
-                defer self.allocator.free(response);
-                try ws.writeMessage(response, .text);
-                continue;
-            };
-            defer self.allocator.free(result.json_str);
-
-            // Send next with payload
-            const next_response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"next\",\"id\":\"{s}\",\"payload\":{s}}}", .{ id, result.json_str });
-            defer self.allocator.free(next_response);
-            try ws.writeMessage(next_response, .text);
-
-            // Send complete
-            const complete_response = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"complete\",\"id\":\"{s}\"}}", .{id});
-            defer self.allocator.free(complete_response);
-            try ws.writeMessage(complete_response, .text);
-            continue;
-        }
-
-        if (std.mem.eql(u8, msg_type, "complete")) {
-            const id = if (obj.get("id")) |id_val| (if (id_val == .string) id_val.string else continue) else continue;
-            if (active_subs.getPtr(id)) |entry| {
-                entry.stream.cancel();
-                _ = entry.future.cancel(io) catch {};
-                self.allocator.free(entry.id);
-                _ = active_subs.remove(id);
-            }
-            continue;
-        }
-    }
 }
 
 test "server executeGraphQLAndGetJson basic" {
@@ -1771,7 +1271,7 @@ test "server executeGraphQLAndGetJson basic" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }
@@ -1819,7 +1319,7 @@ test "server depth limit" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }
@@ -1862,7 +1362,7 @@ test "server complexity limit" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }
@@ -1911,7 +1411,7 @@ test "server query whitelist" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }
@@ -2108,34 +1608,28 @@ test "server batch APQ" {
 }
 
 
-fn computeApqSignatureForTest(hash: []const u8, secret: []const u8) [std.crypto.auth.hmac.sha2.HmacSha256.mac_length * 2]u8 {
-    var mac_bytes: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_bytes, hash, secret);
-    return std.fmt.bytesToHex(mac_bytes, .lower);
-}
-
 test "verifyApqSignature basic" {
     const hash = "abc123";
     const secret = "my-secret";
-    const sig_hex = computeApqSignatureForTest(hash, secret);
+    const sig_hex = apq.computeApqSignatureForTest(hash, secret);
 
     // No secret configured → always valid
-    try std.testing.expect(verifyApqSignature(null, hash, null));
-    try std.testing.expect(verifyApqSignature(null, hash, &sig_hex));
+    try std.testing.expect(apq.verifyApqSignature(null, hash, null));
+    try std.testing.expect(apq.verifyApqSignature(null, hash, &sig_hex));
 
     // Secret configured but no signature → invalid
-    try std.testing.expect(!verifyApqSignature(secret, hash, null));
+    try std.testing.expect(!apq.verifyApqSignature(secret, hash, null));
 
     // Valid signature
-    try std.testing.expect(verifyApqSignature(secret, hash, &sig_hex));
+    try std.testing.expect(apq.verifyApqSignature(secret, hash, &sig_hex));
 
     // Invalid signature
     var bad_sig = sig_hex;
     bad_sig[0] = if (bad_sig[0] == 'a') 'b' else 'a';
-    try std.testing.expect(!verifyApqSignature(secret, hash, &bad_sig));
+    try std.testing.expect(!apq.verifyApqSignature(secret, hash, &bad_sig));
 
     // Wrong hash
-    try std.testing.expect(!verifyApqSignature(secret, "wrong-hash", &sig_hex));
+    try std.testing.expect(!apq.verifyApqSignature(secret, "wrong-hash", &sig_hex));
 }
 
 test "server batch APQ with HMAC signature" {
@@ -2168,7 +1662,7 @@ test "server batch APQ with HMAC signature" {
     defer allocator.free(hash);
 
     const secret = "test-secret";
-    const sig_hex = computeApqSignatureForTest(hash, secret);
+    const sig_hex = apq.computeApqSignatureForTest(hash, secret);
 
     // Valid signature → should succeed
     {
@@ -2291,7 +1785,7 @@ test "server response cache is tenant-isolated" {
         var viter = variables.iterator();
         while (viter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(allocator);
         }
         variables.deinit();
     }

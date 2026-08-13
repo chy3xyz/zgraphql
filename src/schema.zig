@@ -407,7 +407,7 @@ pub const InputValue = struct {
 
     pub fn deinit(self: *InputValue, allocator: std.mem.Allocator) void {
         self.value_type.deinit(allocator);
-        if (self.default_value) |*dv| dv.deinit();
+        if (self.default_value) |*dv| dv.deinit(allocator);
     }
 };
 

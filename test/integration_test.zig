@@ -36,13 +36,13 @@ test "DataLoader concurrent loadMany deduplicates batch calls" {
 
     const vals_a = try dl.loadMany(keys_a);
     defer {
-        for (vals_a) |*v| v.deinit();
+        for (vals_a) |*v| v.deinit(allocator);
         allocator.free(vals_a);
     }
 
     const vals_b = try dl.loadMany(keys_b);
     defer {
-        for (vals_b) |*v| v.deinit();
+        for (vals_b) |*v| v.deinit(allocator);
         allocator.free(vals_b);
     }
 
@@ -119,9 +119,9 @@ test "Server batch execute with mixed valid and invalid queries" {
         var executor = zg.Executor.init(allocator, &schema_def, io);
         defer executor.deinit();
         var result = try executor.execute(&doc);
-        defer result.deinit();
+        defer result.deinit(allocator);
 
-        const json_str = try result.toJson();
+        const json_str = try result.toJson(allocator);
         defer allocator.free(json_str);
         try results.append(try allocator.dupe(u8, json_str));
     }

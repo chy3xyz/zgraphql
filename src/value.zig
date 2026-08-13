@@ -7,8 +7,11 @@ fn ArrayList(comptime T: type) type {
 
 /// GraphQL Value representation.
 /// Maps directly to the GraphQL specification's value types.
+///
+/// A `Value` does not own an allocator; release and cloning methods take an
+/// explicit allocator argument. This matches the Zig convention and allows a
+/// value to be moved across allocator boundaries (e.g. into an arena).
 pub const Value = struct {
-    allocator: std.mem.Allocator,
     data: Data,
 
     pub const Data = union(enum) {
@@ -22,55 +25,63 @@ pub const Value = struct {
         object: std.StringHashMap(Value),
     };
 
+    /// The allocator argument is accepted for API consistency but not stored;
+    /// primitive values carry no owned memory.
     pub fn fromNull(allocator: std.mem.Allocator) Value {
-        return .{ .allocator = allocator, .data = .{ .null = {} } };
+        _ = allocator;
+        return .{ .data = .{ .null = {} } };
     }
 
     pub fn fromInt(allocator: std.mem.Allocator, v: i64) Value {
-        return .{ .allocator = allocator, .data = .{ .int = v } };
+        _ = allocator;
+        return .{ .data = .{ .int = v } };
     }
 
     pub fn fromFloat(allocator: std.mem.Allocator, v: f64) Value {
-        return .{ .allocator = allocator, .data = .{ .float = v } };
+        _ = allocator;
+        return .{ .data = .{ .float = v } };
     }
 
     /// Takes ownership of the string slice.
     pub fn fromString(allocator: std.mem.Allocator, v: []const u8) Value {
-        return .{ .allocator = allocator, .data = .{ .string = v } };
+        _ = allocator;
+        return .{ .data = .{ .string = v } };
     }
 
     pub fn fromBool(allocator: std.mem.Allocator, v: bool) Value {
-        return .{ .allocator = allocator, .data = .{ .boolean = v } };
+        _ = allocator;
+        return .{ .data = .{ .boolean = v } };
     }
 
     /// Takes ownership of the string slice.
     pub fn fromEnum(allocator: std.mem.Allocator, v: []const u8) Value {
-        return .{ .allocator = allocator, .data = .{ .enum_value = v } };
+        _ = allocator;
+        return .{ .data = .{ .enum_value = v } };
     }
 
     pub fn initList(allocator: std.mem.Allocator) Value {
-        return .{ .allocator = allocator, .data = .{ .list = ArrayList(Value).init(allocator) } };
+        return .{ .data = .{ .list = ArrayList(Value).init(allocator) } };
     }
 
     pub fn initObject(allocator: std.mem.Allocator) Value {
-        return .{ .allocator = allocator, .data = .{ .object = std.StringHashMap(Value).init(allocator) } };
+        return .{ .data = .{ .object = std.StringHashMap(Value).init(allocator) } };
     }
 
-    pub fn deinit(self: *Value) void {
+    pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         switch (self.data) {
-            .string => |v| self.allocator.free(v),
-            .enum_value => |v| self.allocator.free(v),
+            .string => |v| allocator.free(v),
+            .enum_value => |v| allocator.free(v),
             .list => |*list| {
                 for (list.items) |*item| {
-                    item.deinit();
+                    item.deinit(allocator);
                 }
                 list.deinit();
             },
             .object => |*obj| {
                 var iter = obj.iterator();
                 while (iter.next()) |entry| {
-                    self.allocator.free(entry.key_ptr.*);
-                    entry.value_ptr.deinit();
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(allocator);
                 }
                 obj.deinit();
             },
@@ -78,15 +89,8 @@ pub const Value = struct {
         }
     }
 
-    /// Deep clone a value using its embedded allocator.
-    pub fn clone(self: Value) std.mem.Allocator.Error!Value {
-        return self.cloneWith(self.allocator);
-    }
-
-    /// Deep clone a value into a caller-chosen allocator. This enables moving
-    /// values across allocator boundaries (e.g. into an arena or a
-    /// request-scoped allocator) without re-allocating the source.
-    pub fn cloneWith(self: Value, allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
+    /// Deep clone a value into a caller-chosen allocator.
+    pub fn clone(self: Value, allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
         switch (self.data) {
             .null => return fromNull(allocator),
             .int => |v| return fromInt(allocator, v),
@@ -96,20 +100,20 @@ pub const Value = struct {
             .enum_value => |v| return fromEnum(allocator, try allocator.dupe(u8, v)),
             .list => |list| {
                 var new = initList(allocator);
-                errdefer new.deinit();
+                errdefer new.deinit(allocator);
                 for (list.items) |item| {
-                    try new.data.list.append(try item.cloneWith(allocator));
+                    try new.data.list.append(try item.clone(allocator));
                 }
                 return new;
             },
             .object => |obj| {
                 var new = initObject(allocator);
-                errdefer new.deinit();
+                errdefer new.deinit(allocator);
                 var iter = obj.iterator();
                 while (iter.next()) |entry| {
                     const key = try allocator.dupe(u8, entry.key_ptr.*);
                     errdefer allocator.free(key);
-                    try new.data.object.put(key, try entry.value_ptr.cloneWith(allocator));
+                    try new.data.object.put(key, try entry.value_ptr.clone(allocator));
                 }
                 return new;
             },
@@ -119,14 +123,14 @@ pub const Value = struct {
     pub const JsonError = std.mem.Allocator.Error || std.Io.Writer.Error;
 
     /// Serialize to JSON. Caller owns the returned string.
-    pub fn toJson(self: Value) JsonError![]const u8 {
-        var allocating = std.Io.Writer.Allocating.init(self.allocator);
-        try self.writeJson(&allocating.writer);
+    pub fn toJson(self: Value, allocator: std.mem.Allocator) JsonError![]const u8 {
+        var allocating = std.Io.Writer.Allocating.init(allocator);
+        try self.writeJson(&allocating.writer, allocator);
         var arr = allocating.toArrayList();
-        return arr.toOwnedSlice(self.allocator);
+        return arr.toOwnedSlice(allocator);
     }
 
-    pub fn writeJson(self: Value, writer: *std.Io.Writer) JsonError!void {
+    pub fn writeJson(self: Value, writer: *std.Io.Writer, allocator: std.mem.Allocator) JsonError!void {
         switch (self.data) {
             .null => try writer.writeAll("null"),
             .int => |v| try writer.print("{d}", .{v}),
@@ -146,14 +150,14 @@ pub const Value = struct {
                 try writer.writeByte('[');
                 for (list.items, 0..) |item, i| {
                     if (i > 0) try writer.writeByte(',');
-                    try item.writeJson(writer);
+                    try item.writeJson(writer, allocator);
                 }
                 try writer.writeByte(']');
             },
             .object => |obj| {
                 try writer.writeByte('{');
                 // Sort keys for deterministic output
-                var sorted = ArrayList([]const u8).init(obj.allocator);
+                var sorted = ArrayList([]const u8).init(allocator);
                 defer sorted.deinit();
                 var key_iter = obj.keyIterator();
                 while (key_iter.next()) |key| {
@@ -168,7 +172,7 @@ pub const Value = struct {
                     if (i > 0) try writer.writeByte(',');
                     try writeJsonString(key, writer);
                     try writer.writeByte(':');
-                    try obj.get(key).?.writeJson(writer);
+                    try obj.get(key).?.writeJson(writer, allocator);
                 }
                 try writer.writeByte('}');
             },
@@ -193,14 +197,6 @@ pub const Value = struct {
             },
             .object => return false, // Deep object comparison omitted for simplicity
         }
-    }
-
-    pub fn format(self: Value, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
-        const json_str = try self.toJson();
-        defer self.allocator.free(json_str);
-        try writer.writeAll(json_str);
     }
 
     /// Parse a JSON string into a GraphQL Value tree.
@@ -232,7 +228,7 @@ pub const Value = struct {
             .string => |s| return fromString(allocator, try allocator.dupe(u8, s)),
             .array => |arr| {
                 var list = initList(allocator);
-                errdefer list.deinit();
+                errdefer list.deinit(allocator);
                 for (arr.items) |item| {
                     try list.data.list.append(try fromStdJson(allocator, item));
                 }
@@ -240,7 +236,7 @@ pub const Value = struct {
             },
             .object => |obj| {
                 var graph_obj = initObject(allocator);
-                errdefer graph_obj.deinit();
+                errdefer graph_obj.deinit(allocator);
                 var iter = obj.iterator();
                 while (iter.next()) |entry| {
                     try graph_obj.data.object.put(try allocator.dupe(u8, entry.key_ptr.*), try fromStdJson(allocator, entry.value_ptr.*));
@@ -293,43 +289,43 @@ test "value json serialization" {
 
     // Null
     var null_val = Value.fromNull(allocator);
-    const null_json = try null_val.toJson();
+    const null_json = try null_val.toJson(allocator);
     defer allocator.free(null_json);
     try std.testing.expectEqualStrings("null", null_json);
-    null_val.deinit();
+    null_val.deinit(allocator);
 
     // Int
     var int_val = Value.fromInt(allocator, 42);
-    const int_json = try int_val.toJson();
+    const int_json = try int_val.toJson(allocator);
     defer allocator.free(int_json);
     try std.testing.expectEqualStrings("42", int_json);
-    int_val.deinit();
+    int_val.deinit(allocator);
 
     // String with escaping
     const str_dup = try allocator.dupe(u8, "hello\nworld\"\\");
     var str_val = Value.fromString(allocator, str_dup);
-    const str_json = try str_val.toJson();
+    const str_json = try str_val.toJson(allocator);
     defer allocator.free(str_json);
     try std.testing.expectEqualStrings("\"hello\\nworld\\\"\\\\\"", str_json);
-    str_val.deinit();
+    str_val.deinit(allocator);
 
     // List
     var list = Value.initList(allocator);
     try list.data.list.append(Value.fromInt(allocator, 1));
     try list.data.list.append(Value.fromString(allocator, try allocator.dupe(u8, "two")));
-    const list_json = try list.toJson();
+    const list_json = try list.toJson(allocator);
     defer allocator.free(list_json);
     try std.testing.expectEqualStrings("[1,\"two\"]", list_json);
-    list.deinit();
+    list.deinit(allocator);
 
     // Object
     var obj = Value.initObject(allocator);
     try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, "Alice")));
     try obj.data.object.put(try allocator.dupe(u8, "age"), Value.fromInt(allocator, 30));
-    const obj_json = try obj.toJson();
+    const obj_json = try obj.toJson(allocator);
     defer allocator.free(obj_json);
     try std.testing.expectEqualStrings("{\"age\":30,\"name\":\"Alice\"}", obj_json);
-    obj.deinit();
+    obj.deinit(allocator);
 }
 
 test "value clone" {
@@ -339,9 +335,9 @@ test "value clone" {
     var nested_list = original.data.object.getPtr("nested").?;
     try nested_list.data.list.append(Value.fromString(allocator, try allocator.dupe(u8, "deep")));
 
-    var cloned = try original.clone();
-    defer cloned.deinit();
-    defer original.deinit();
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+    defer original.deinit(allocator);
 
     try std.testing.expect(original.data.object.get("nested").?.data.list.items[0].data.string.ptr !=
         cloned.data.object.get("nested").?.data.list.items[0].data.string.ptr);
@@ -353,45 +349,45 @@ test "value fromJson roundtrip" {
 
     // Primitives
     var null_val = try Value.fromJson(allocator, "null");
-    defer null_val.deinit();
+    defer null_val.deinit(allocator);
     try std.testing.expect(null_val.data == .null);
 
     var int_val = try Value.fromJson(allocator, "42");
-    defer int_val.deinit();
+    defer int_val.deinit(allocator);
     try std.testing.expectEqual(@as(i64, 42), int_val.data.int);
 
     var float_val = try Value.fromJson(allocator, "3.14");
-    defer float_val.deinit();
+    defer float_val.deinit(allocator);
     try std.testing.expectEqual(@as(f64, 3.14), float_val.data.float);
 
     var str_val = try Value.fromJson(allocator, "\"hello\"");
-    defer str_val.deinit();
+    defer str_val.deinit(allocator);
     try std.testing.expectEqualStrings("hello", str_val.data.string);
 
     var bool_val = try Value.fromJson(allocator, "true");
-    defer bool_val.deinit();
+    defer bool_val.deinit(allocator);
     try std.testing.expect(bool_val.data.boolean);
 
     // Array
     var arr_val = try Value.fromJson(allocator, "[1, 2, 3]");
-    defer arr_val.deinit();
+    defer arr_val.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), arr_val.data.list.items.len);
     try std.testing.expectEqual(@as(i64, 1), arr_val.data.list.items[0].data.int);
 
     // Object
     var obj_val = try Value.fromJson(allocator, "{\"name\":\"Alice\",\"age\":30}");
-    defer obj_val.deinit();
+    defer obj_val.deinit(allocator);
     try std.testing.expectEqualStrings("Alice", obj_val.data.object.get("name").?.data.string);
     try std.testing.expectEqual(@as(i64, 30), obj_val.data.object.get("age").?.data.int);
 
     // Roundtrip: Value → JSON → Value → JSON
     var original = Value.initObject(allocator);
     try original.data.object.put(try allocator.dupe(u8, "x"), Value.fromInt(allocator, 1));
-    const json = try original.toJson();
+    const json = try original.toJson(allocator);
     defer allocator.free(json);
     var roundtripped = try Value.fromJson(allocator, json);
-    defer roundtripped.deinit();
-    defer original.deinit();
+    defer roundtripped.deinit(allocator);
+    defer original.deinit(allocator);
     try std.testing.expectEqual(@as(i64, 1), roundtripped.data.object.get("x").?.data.int);
 }
 
@@ -407,14 +403,14 @@ test "value cloneWith crosses allocator boundary" {
     const arena_alloc = arena.allocator();
 
     var original = Value.initObject(allocator);
-    defer original.deinit();
+    defer original.deinit(allocator);
     try original.data.object.put(try allocator.dupe(u8, "nested"), Value.initList(allocator));
     var nested_list = original.data.object.getPtr("nested").?;
     try nested_list.data.list.append(Value.fromString(allocator, try allocator.dupe(u8, "deep")));
 
     // Clone into the arena: the clone must be owned by the arena allocator.
-    var cloned = try original.cloneWith(arena_alloc);
-    defer cloned.deinit();
+    var cloned = try original.clone(arena_alloc);
+    defer cloned.deinit(arena_alloc);
 
     try std.testing.expect(original.data.object.get("nested").?.data.list.items[0].data.string.ptr !=
         cloned.data.object.get("nested").?.data.list.items[0].data.string.ptr);

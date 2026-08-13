@@ -40,7 +40,7 @@ pub const DataLoader = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.cache.deinit();
 
@@ -68,7 +68,7 @@ pub const DataLoader = struct {
         defer self.mutex.unlock(self.io);
 
         if (self.cache.get(key)) |v| {
-            return try v.clone();
+            return try v.clone(self.allocator);
         }
         return null;
     }
@@ -80,15 +80,15 @@ pub const DataLoader = struct {
 
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
-        var owned_value = try value.clone();
-        errdefer owned_value.deinit();
+        var owned_value = try value.clone(self.allocator);
+        errdefer owned_value.deinit(self.allocator);
 
         // Remove old entry if exists
         const removed = self.cache.fetchRemove(key);
         if (removed) |old| {
             self.allocator.free(old.key);
             var val = old.value;
-            val.deinit();
+            val.deinit(self.allocator);
         }
 
         try self.cache.put(owned_key, owned_value);
@@ -116,7 +116,7 @@ pub const DataLoader = struct {
         if (uncached.items.len > 0) {
             const values = try batch_fn(self.batch_ctx, self.allocator, uncached.items);
             defer {
-                for (values) |*v| v.deinit();
+                for (values) |*v| v.deinit(self.allocator);
                 self.allocator.free(values);
             }
 
@@ -125,8 +125,8 @@ pub const DataLoader = struct {
             for (uncached.items, values) |k, v| {
                 const owned_key = try self.allocator.dupe(u8, k);
                 errdefer self.allocator.free(owned_key);
-                var owned_value = try v.clone();
-                errdefer owned_value.deinit();
+                var owned_value = try v.clone(self.allocator);
+                errdefer owned_value.deinit(self.allocator);
                 try self.cache.put(owned_key, owned_value);
             }
         }
@@ -134,12 +134,12 @@ pub const DataLoader = struct {
         // Build result
         var result = try self.allocator.alloc(Value, keys.len);
         errdefer {
-            for (result) |*v| v.deinit();
+            for (result) |*v| v.deinit(self.allocator);
             self.allocator.free(result);
         }
 
         for (keys, 0..) |k, i| {
-            result[i] = try self.cache.get(k).?.clone();
+            result[i] = try self.cache.get(k).?.clone(self.allocator);
         }
 
         return result;
@@ -188,7 +188,7 @@ pub const DataLoader = struct {
 
                 const values = try batch_fn(self.batch_ctx, self.allocator, keys_list.items);
                 defer {
-                    for (values) |*v| v.deinit();
+                    for (values) |*v| v.deinit(self.allocator);
                     self.allocator.free(values);
                 }
 
@@ -223,7 +223,7 @@ pub const DataLoader = struct {
         var iter = self.cache.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.cache.clearRetainingCapacity();
     }
@@ -239,12 +239,12 @@ test "dataloader cache" {
 
     // Prime cache
     var val = Value.fromString(allocator, try allocator.dupe(u8, "hello"));
-    defer val.deinit();
+    defer val.deinit(allocator);
     try dl.prime("key1", val);
 
     // Load from cache
     var loaded = (try dl.load("key1")).?;
-    defer loaded.deinit();
+    defer loaded.deinit(allocator);
     try std.testing.expectEqualStrings("hello", loaded.data.string);
 
     // Missing key
@@ -279,7 +279,7 @@ test "dataloader loadMany" {
     const keys = &[_][]const u8{ "a", "b", "c" };
     const values = try dl.loadMany(keys);
     defer {
-        for (values) |*v| v.deinit();
+        for (values) |*v| v.deinit(allocator);
         allocator.free(values);
     }
 
@@ -291,7 +291,7 @@ test "dataloader loadMany" {
     // Second loadMany with same keys - should NOT call batch (cached)
     const values2 = try dl.loadMany(keys);
     defer {
-        for (values2) |*v| v.deinit();
+        for (values2) |*v| v.deinit(allocator);
         allocator.free(values2);
     }
 

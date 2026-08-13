@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-06
+
+### Changed
+- **`Value` no longer stores an allocator** (breaking): `deinit`, `clone`, `toJson`, and `writeJson` now take an explicit allocator argument, matching the Zig convention and enabling cross-allocator cloning (e.g. into an arena). `cloneWith` was folded into `clone(self, allocator)`; the allocator-dependent `format` method was removed.
+- **`server.zig` split** into `server.zig` (HTTP core), `server_ws.zig` (WebSocket graphql-ws protocol), `server_apq.zig` (Automatic Persisted Queries), and `server_playground.zig` (playground HTML). `server.zig` dropped from ~2314 to ~1808 lines.
+
 ## [0.5.0] - 2026-08-06
 
 ### Fixed
@@ -113,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
+[0.6.0]: https://github.com/chy3xyz/zgraphql/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/chy3xyz/zgraphql/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/chy3xyz/zgraphql/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/chy3xyz/zgraphql/compare/v0.3.1...v0.4.0

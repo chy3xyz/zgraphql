@@ -6,11 +6,11 @@ const Value = @import("value.zig").Value;
 pub const Introspection = struct {
     pub fn buildSchemaValue(allocator: std.mem.Allocator, schema_def: *schema.Schema) std.mem.Allocator.Error!Value {
         var result = Value.initObject(allocator);
-        errdefer result.deinit();
+        errdefer result.deinit(allocator);
 
         // types
         var types_list = Value.initList(allocator);
-        errdefer types_list.deinit();
+        errdefer types_list.deinit(allocator);
         var iter = schema_def.types.iterator();
         while (iter.next()) |entry| {
             try types_list.data.list.append(try buildTypeValue(allocator, schema_def, entry.value_ptr.*));
@@ -36,7 +36,7 @@ pub const Introspection = struct {
 
         // directives
         var directives_list = Value.initList(allocator);
-        errdefer directives_list.deinit();
+        errdefer directives_list.deinit(allocator);
         var diter = schema_def.directives.iterator();
         while (diter.next()) |entry| {
             try directives_list.data.list.append(try buildDirectiveValue(allocator, schema_def, entry.value_ptr.*));
@@ -48,7 +48,7 @@ pub const Introspection = struct {
 
     pub fn buildTypeValue(allocator: std.mem.Allocator, schema_def: *schema.Schema, typ: *schema.Type) std.mem.Allocator.Error!Value {
         var obj = Value.initObject(allocator);
-        errdefer obj.deinit();
+        errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, typ.name)));
         try obj.data.object.put(try allocator.dupe(u8, "kind"), Value.fromString(allocator, try allocator.dupe(u8, typeKindString(typ))));
@@ -57,7 +57,7 @@ pub const Introspection = struct {
         switch (typ.kind) {
             .object => |*obj_type| {
                 var fields = Value.initList(allocator);
-                errdefer fields.deinit();
+                errdefer fields.deinit(allocator);
                 var fiter = obj_type.fields.iterator();
                 while (fiter.next()) |entry| {
                     try fields.data.list.append(try buildFieldValue(allocator, schema_def, entry.value_ptr.*));
@@ -66,7 +66,7 @@ pub const Introspection = struct {
 
                 // interfaces
                 var interfaces = Value.initList(allocator);
-                errdefer interfaces.deinit();
+                errdefer interfaces.deinit(allocator);
                 for (obj_type.interfaces.items) |iface_name| {
                     if (schema_def.getType(iface_name)) |iface_type| {
                         try interfaces.data.list.append(try buildTypeValue(allocator, schema_def, iface_type));
@@ -88,7 +88,7 @@ pub const Introspection = struct {
             },
             .interface => |*iface_type| {
                 var fields = Value.initList(allocator);
-                errdefer fields.deinit();
+                errdefer fields.deinit(allocator);
                 var fiter = iface_type.fields.iterator();
                 while (fiter.next()) |entry| {
                     try fields.data.list.append(try buildFieldValue(allocator, schema_def, entry.value_ptr.*));
@@ -99,7 +99,7 @@ pub const Introspection = struct {
 
                 // possibleTypes: objects that implement this interface
                 var possible_types = Value.initList(allocator);
-                errdefer possible_types.deinit();
+                errdefer possible_types.deinit(allocator);
                 var titer = schema_def.types.iterator();
                 while (titer.next()) |entry| {
                     const t = entry.value_ptr.*;
@@ -121,7 +121,7 @@ pub const Introspection = struct {
                 try obj.data.object.put(try allocator.dupe(u8, "interfaces"), Value.initList(allocator));
 
                 var possible_types = Value.initList(allocator);
-                errdefer possible_types.deinit();
+                errdefer possible_types.deinit(allocator);
                 for (u.possible_types.items) |pt_name| {
                     if (schema_def.getType(pt_name)) |pt_type| {
                         try possible_types.data.list.append(try buildTypeValue(allocator, schema_def, pt_type));
@@ -137,7 +137,7 @@ pub const Introspection = struct {
                 try obj.data.object.put(try allocator.dupe(u8, "possibleTypes"), Value.fromNull(allocator));
 
                 var enum_values = Value.initList(allocator);
-                errdefer enum_values.deinit();
+                errdefer enum_values.deinit(allocator);
                 var eviter = e.values.iterator();
                 while (eviter.next()) |entry| {
                     var ev_obj = Value.initObject(allocator);
@@ -156,7 +156,7 @@ pub const Introspection = struct {
                 try obj.data.object.put(try allocator.dupe(u8, "enumValues"), Value.fromNull(allocator));
 
                 var input_fields = Value.initList(allocator);
-                errdefer input_fields.deinit();
+                errdefer input_fields.deinit(allocator);
                 var ifiter = io_type.fields.iterator();
                 while (ifiter.next()) |entry| {
                     try input_fields.data.list.append(try buildInputValueValue(allocator, schema_def, entry.value_ptr.*));
@@ -170,14 +170,14 @@ pub const Introspection = struct {
 
     fn buildFieldValue(allocator: std.mem.Allocator, schema_def: *schema.Schema, field: schema.Field) std.mem.Allocator.Error!Value {
         var obj = Value.initObject(allocator);
-        errdefer obj.deinit();
+        errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, field.name)));
         try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
         try obj.data.object.put(try allocator.dupe(u8, "type"), try buildTypeRefValue(allocator, schema_def, @constCast(&field.field_type)));
 
         var args = Value.initList(allocator);
-        errdefer args.deinit();
+        errdefer args.deinit(allocator);
         var aiter = field.arguments.iterator();
         while (aiter.next()) |entry| {
             try args.data.list.append(try buildInputValueValue(allocator, schema_def, entry.value_ptr.*));
@@ -195,7 +195,7 @@ pub const Introspection = struct {
 
     fn buildTypeRefValue(allocator: std.mem.Allocator, schema_def: *schema.Schema, t: *schema.TypeRef) std.mem.Allocator.Error!Value {
         var obj = Value.initObject(allocator);
-        errdefer obj.deinit();
+        errdefer obj.deinit(allocator);
 
         switch (t.kind) {
             .named => |name| {
@@ -222,7 +222,7 @@ pub const Introspection = struct {
 
     fn buildInputValueValue(allocator: std.mem.Allocator, schema_def: *schema.Schema, iv: schema.InputValue) std.mem.Allocator.Error!Value {
         var obj = Value.initObject(allocator);
-        errdefer obj.deinit();
+        errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, iv.name)));
         try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
@@ -234,20 +234,20 @@ pub const Introspection = struct {
 
     fn buildDirectiveValue(allocator: std.mem.Allocator, schema_def: *schema.Schema, dd: schema.DirectiveDefinition) std.mem.Allocator.Error!Value {
         var obj = Value.initObject(allocator);
-        errdefer obj.deinit();
+        errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, dd.name)));
         try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
 
         var locations = Value.initList(allocator);
-        errdefer locations.deinit();
+        errdefer locations.deinit(allocator);
         for (dd.locations.items) |loc| {
             try locations.data.list.append(Value.fromString(allocator, try allocator.dupe(u8, directiveLocationString(loc))));
         }
         try obj.data.object.put(try allocator.dupe(u8, "locations"), locations);
 
         var args = Value.initList(allocator);
-        errdefer args.deinit();
+        errdefer args.deinit(allocator);
         var aiter = dd.arguments.iterator();
         while (aiter.next()) |entry| {
             try args.data.list.append(try buildInputValueValue(allocator, schema_def, entry.value_ptr.*));
@@ -311,7 +311,7 @@ test "introspection basic" {
     try schema_def.registerType("Query", query_type);
 
     var result = try Introspection.buildSchemaValue(allocator, &schema_def);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expect(result.data.object.contains("types"));
     try std.testing.expect(result.data.object.contains("queryType"));

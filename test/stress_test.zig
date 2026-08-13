@@ -72,9 +72,9 @@ fn runIteration(allocator: std.mem.Allocator, schema_def: *zg.schema.Schema, io:
     var executor = zg.Executor.init(allocator, schema_def, io);
     defer executor.deinit();
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
-    const json_str = try result.toJson();
+    const json_str = try result.toJson(allocator);
     defer allocator.free(json_str);
 }
 

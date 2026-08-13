@@ -242,7 +242,7 @@ fn serializeValue(allocator: std.mem.Allocator, val: anytype) !Value {
         },
         .@"struct" => {
             var obj = Value.initObject(allocator);
-            errdefer obj.deinit();
+            errdefer obj.deinit(allocator);
             inline for (@typeInfo(T).@"struct".field_names) |name| {
                 const field_val = try serializeValue(allocator, @field(val, name));
                 try obj.data.object.put(try allocator.dupe(u8, name), field_val);
@@ -295,7 +295,7 @@ test "TypeSafeSchemaBuilder basic resolver" {
     executor.context.user_data = &ctx;
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expect(result.data == .object);
     const data = result.data.object.get("data") orelse return error.TestUnexpectedResult;
@@ -342,7 +342,7 @@ test "TypeSafeSchemaBuilder resolver with args" {
     defer doc.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expect(result.data == .object);
     const data = result.data.object.get("data") orelse return error.TestUnexpectedResult;
@@ -395,7 +395,7 @@ test "TypeSafeSchemaBuilder resolver returning struct" {
     defer doc.deinit();
 
     var result = try executor.execute(&doc);
-    defer result.deinit();
+    defer result.deinit(allocator);
 
     try std.testing.expect(result.data == .object);
     const data = result.data.object.get("data") orelse return error.TestUnexpectedResult;

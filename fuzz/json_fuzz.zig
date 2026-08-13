@@ -26,7 +26,7 @@ fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) st
         .string => |s| return Value.fromString(allocator, try allocator.dupe(u8, s)),
         .array => |arr| {
             var list = Value.initList(allocator);
-            errdefer list.deinit();
+            errdefer list.deinit(allocator);
             for (arr.items) |item| {
                 try list.data.list.append(try jsonToGraphQLValue(allocator, item));
             }
@@ -34,7 +34,7 @@ fn jsonToGraphQLValue(allocator: std.mem.Allocator, json_val: std.json.Value) st
         },
         .object => |obj| {
             var graph_obj = Value.initObject(allocator);
-            errdefer graph_obj.deinit();
+            errdefer graph_obj.deinit(allocator);
             var iter = obj.iterator();
             while (iter.next()) |entry| {
                 try graph_obj.data.object.put(try allocator.dupe(u8, entry.key_ptr.*), try jsonToGraphQLValue(allocator, entry.value_ptr.*));
@@ -137,7 +137,7 @@ pub fn main() !void {
         var gv = jsonToGraphQLValue(iter_alloc, parsed.value) catch |e| switch (e) {
             error.OutOfMemory => continue,
         };
-        defer gv.deinit();
+        defer gv.deinit(iter_alloc);
 
         ok += 1;
     }

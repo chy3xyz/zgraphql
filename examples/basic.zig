@@ -67,8 +67,8 @@ pub fn main() !void {
 
     // 5. Introspection: generate the __Schema JSON response.
     var intro = try zg.Introspection.buildSchemaValue(allocator, &schema_def);
-    defer intro.deinit();
-    const json = try intro.toJson();
+    defer intro.deinit(allocator);
+    const json = try intro.toJson(allocator);
     defer allocator.free(json);
     std.debug.print("Introspection JSON:\n{s}\n", .{json});
 }
