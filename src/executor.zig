@@ -2015,3 +2015,91 @@ test "executor default variables do not leak across executions" {
     // After both executions, the injected default must have been cleaned up.
     try std.testing.expect(executor.context.variables.count() == 0);
 }
+
+test "executor subscription receives user_data as ctx" {
+    const allocator = std.testing.allocator;
+
+    // Regression test for the server WS subscription path: when user_data is
+    // set on the Executor, the subscribe resolver must receive it as its ctx
+    // (non-null). Previously the WS path never called setUserData, so the
+    // subscribe resolver saw null ctx and panicked on dereference.
+    const CounterStream = struct {
+        max: i64,
+        current: i64,
+
+        fn next(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!?Value {
+            const ctx = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            if (ctx.current >= ctx.max) return null;
+            const val = ctx.current;
+            ctx.current += 1;
+            return Value.fromInt(alloc, val);
+        }
+
+        fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+            const ctx = @as(*@This(), @ptrCast(@alignCast(ptr)));
+            alloc.destroy(ctx);
+        }
+    };
+
+    const TestUserData = struct {
+        seen_ctx: bool = false,
+    };
+    var user_data = TestUserData{};
+
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+
+    const sub_type = try allocator.create(schema.Type);
+    sub_type.* = .{
+        .name = "Subscription",
+        .kind = .{ .object = schema.ObjectType.init(allocator) },
+    };
+    var counter_field = schema.Field.init(allocator, "counter", schema.TypeRef.named("Int"));
+    counter_field.subscribe = struct {
+        fn subscribe(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!schema.SubscriptionStream {
+            // ctx must be the user_data pointer, never null.
+            const ud = @as(*TestUserData, @ptrCast(@alignCast(ctx orelse return error.CtxWasNull)));
+            ud.seen_ctx = true;
+            const c = try alloc.create(CounterStream);
+            c.* = .{ .max = 1, .current = 0 };
+            return schema.SubscriptionStream{
+                .ptr = c,
+                .vtable = &.{
+                    .next = CounterStream.next,
+                    .deinit = CounterStream.deinit,
+                },
+            };
+        }
+    }.subscribe;
+    try sub_type.kind.object.fields.put(try allocator.dupe(u8, "counter"), counter_field);
+
+    var schema_def = schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Subscription", sub_type);
+    schema_def.subscription_type = sub_type;
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var executor = Executor.init(allocator, &schema_def, backend.io());
+    defer executor.deinit();
+    executor.setUserData(&user_data);
+
+    var parser = @import("parser.zig").Parser.init(allocator, "subscription { counter }") catch unreachable;
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var stream = try executor.executeSubscription(&doc);
+    defer stream.deinit(allocator);
+
+    const event_val = (try stream.next(allocator)) orelse return error.TestUnexpectedResult;
+    var event = event_val;
+    defer event.deinit();
+    try std.testing.expect(user_data.seen_ctx);
+}

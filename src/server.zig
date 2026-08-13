@@ -1633,6 +1633,7 @@ fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket) !vo
                 defer executor.deinit();
                 try executor.setVariables(variables);
                 if (self.options.hooks) |hooks| executor.hooks = hooks;
+                if (self.options.user_data) |user_data| executor.setUserData(user_data);
 
                 var stream = executor.executeSubscription(&doc) catch |err| {
                     log.err("websocket subscription error: {s}", .{@errorName(err)});
