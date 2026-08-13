@@ -392,6 +392,13 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         }
     }
 
+    // Tenant resolution (done before WebSocket upgrade so the WS path also
+    // applies per-tenant limits/schema instead of bypassing them).
+    var resolved_tenant: ?*zg.Tenant = null;
+    if (self.options.tenant_manager) |tm| {
+        resolved_tenant = tm.resolve(request.head_buffer);
+    }
+
     // WebSocket upgrade
     const upgrade = request.upgradeRequested();
     if (upgrade == .websocket) {
@@ -421,7 +428,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
         }
         var ws = try request.respondWebSocket(.{ .key = key, .extra_headers = ws_extra[0..ws_extra_count] });
         try ws.output.flush();
-        try ws_handlers.handleWebSocket(self, io, &ws);
+        try ws_handlers.handleWebSocket(self, io, &ws, resolved_tenant);
         had_error = false;
         return;
     }
@@ -481,12 +488,6 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
             had_error = false;
         }
         return;
-    }
-
-    // Tenant resolution
-    var resolved_tenant: ?*zg.Tenant = null;
-    if (self.options.tenant_manager) |tm| {
-        resolved_tenant = tm.resolve(request.head_buffer);
     }
 
     // Rate limiting (applied to GraphQL endpoints only)
@@ -559,7 +560,7 @@ fn handleRequest(self: *GraphQLServer, io: Io, request: *http.Server.Request, cl
 
         // Apollo-style query batching: array of request objects
         if (root == .array) {
-            const batch_result = try executeBatch(self, io, root.array.items);
+            const batch_result = try executeBatch(self, io, root.array.items, resolved_tenant);
             defer self.allocator.free(batch_result.json_str);
             complexity = batch_result.total_complexity;
             had_error = batch_result.had_error;
@@ -1100,6 +1101,7 @@ fn executeBatch(
     self: *GraphQLServer,
     io: Io,
     items: []const std.json.Value,
+    tenant: ?*zg.Tenant,
 ) !struct { json_str: []const u8, total_complexity: u64, had_error: bool } {
     if (items.len > self.options.max_batch_size) {
         const err_json = try buildErrorJson(self.allocator, "Batch size exceeds maximum allowed");
@@ -1189,7 +1191,7 @@ fn executeBatch(
             continue;
         };
 
-        const batch_result = executeGraphQLAndGetJson(self, io, batch_query, batch_op_name, &batch_variables, null) catch |err| {
+        const batch_result = executeGraphQLAndGetJson(self, io, batch_query, batch_op_name, &batch_variables, tenant) catch |err| {
             log.err("batch execution pipeline error: {s}", .{@errorName(err)});
             const err_json = try buildErrorJson(self.allocator, "Internal error");
             try results.append(err_json);
@@ -1458,7 +1460,7 @@ test "server batch execute multiple queries" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, batch_json, .{});
     defer parsed.deinit();
 
-    const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+    const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
     defer allocator.free(result.json_str);
 
     try std.testing.expect(!result.had_error);
@@ -1501,7 +1503,7 @@ test "server batch with missing query" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, batch_json, .{});
     defer parsed.deinit();
 
-    const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+    const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
     defer allocator.free(result.json_str);
 
     try std.testing.expect(result.had_error);
@@ -1545,7 +1547,7 @@ test "server batch with depth limit error" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, batch_json, .{});
     defer parsed.deinit();
 
-    const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+    const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
     defer allocator.free(result.json_str);
 
     try std.testing.expect(result.had_error);
@@ -1600,7 +1602,7 @@ test "server batch APQ" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, batch_json, .{});
     defer parsed.deinit();
 
-    const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+    const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
     defer allocator.free(result.json_str);
 
     try std.testing.expect(!result.had_error);
@@ -1684,7 +1686,7 @@ test "server batch APQ with HMAC signature" {
         var backend = IoBackend.init(allocator, .{});
         defer backend.deinit();
 
-        const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+        const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
         defer allocator.free(result.json_str);
 
         try std.testing.expect(!result.had_error);
@@ -1714,7 +1716,7 @@ test "server batch APQ with HMAC signature" {
         var backend = IoBackend.init(allocator, .{});
         defer backend.deinit();
 
-        const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+        const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
         defer allocator.free(result.json_str);
 
         try std.testing.expect(result.had_error);
@@ -1740,7 +1742,7 @@ test "server batch APQ with HMAC signature" {
         var backend = IoBackend.init(allocator, .{});
         defer backend.deinit();
 
-        const result = try executeBatch(&server, backend.io(), parsed.value.array.items);
+        const result = try executeBatch(&server, backend.io(), parsed.value.array.items, null);
         defer allocator.free(result.json_str);
 
         try std.testing.expect(result.had_error);

@@ -52,7 +52,7 @@ pub const Introspection = struct {
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, typ.name)));
         try obj.data.object.put(try allocator.dupe(u8, "kind"), Value.fromString(allocator, try allocator.dupe(u8, typeKindString(typ))));
-        try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
+        try obj.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, typ.description));
 
         switch (typ.kind) {
             .object => |*obj_type| {
@@ -173,7 +173,7 @@ pub const Introspection = struct {
         errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, field.name)));
-        try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
+        try obj.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, field.description));
         try obj.data.object.put(try allocator.dupe(u8, "type"), try buildTypeRefValue(allocator, schema_def, @constCast(&field.field_type)));
 
         var args = Value.initList(allocator);
@@ -225,9 +225,14 @@ pub const Introspection = struct {
         errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, iv.name)));
-        try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
+        try obj.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, iv.description));
         try obj.data.object.put(try allocator.dupe(u8, "type"), try buildTypeRefValue(allocator, schema_def, @constCast(&iv.value_type)));
-        try obj.data.object.put(try allocator.dupe(u8, "defaultValue"), Value.fromNull(allocator));
+        if (iv.default_value) |dv| {
+            const dv_json = dv.toJson(allocator) catch return error.OutOfMemory;
+            try obj.data.object.put(try allocator.dupe(u8, "defaultValue"), Value.fromString(allocator, dv_json));
+        } else {
+            try obj.data.object.put(try allocator.dupe(u8, "defaultValue"), Value.fromNull(allocator));
+        }
 
         return obj;
     }
@@ -237,7 +242,7 @@ pub const Introspection = struct {
         errdefer obj.deinit(allocator);
 
         try obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, dd.name)));
-        try obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
+        try obj.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, dd.description));
 
         var locations = Value.initList(allocator);
         errdefer locations.deinit(allocator);
@@ -283,8 +288,13 @@ pub const Introspection = struct {
         };
     }
 
-    fn typeKindString(typ: *schema.Type) []const u8 {
-        return switch (typ.kind) {
+    /// Build a string Value from an optional description, or null.
+    fn nullableString(allocator: std.mem.Allocator, s: ?[]const u8) std.mem.Allocator.Error!Value {
+        if (s) |v| return Value.fromString(allocator, try allocator.dupe(u8, v));
+        return Value.fromNull(allocator);
+    }
+
+    fn typeKindString(typ: *schema.Type) []const u8 {        return switch (typ.kind) {
             .scalar => "SCALAR",
             .object => "OBJECT",
             .interface => "INTERFACE",

@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Tenant isolation bypass in batch and WebSocket paths**: batched requests and WS single-shot queries passed `tenant=null` to the execution pipeline, so they fell back to global limits/schema instead of the resolved tenant's. Tenant resolution is now done before the WS upgrade and threaded through both paths.
+- **SDL parser gaps**: added directive-definition parsing (`directive @x(...) [repeatable] on ...`), field `@deprecated(reason:)` parsing, and argument default values; also fixed a double-free when registering parsed directives and a dangling `deprecation_reason`.
+- **Introspection metadata**: `description` and `defaultValue` are now populated from the schema instead of always being `null`.
+- **Validator spec gaps**: added UniqueOperationNames, LoneAnonymousOperation, NoUnusedFragments, VariablesAreInputTypes, constant variable defaults, and OverlappingFieldsCanBeMerged.
+- **WS protocol**: handle `connection_terminate`.
 - **`HttpCacheBackend.setImpl`/`deleteImpl` swallowed non-2xx status**: the HTTP status from `client.fetch` was discarded, so a failed cache write (404/500/503) silently reported success. Non-2xx now returns `error.CacheWriteFailed`.
 - **Subscription allocator contract documented + asserted**: `SubscriptionStream.next` results from `Executor.executeSubscription` must use the Executor's allocator; a debug-mode assertion now catches a mismatch instead of corrupting the heap silently.
 - **`DataLoader.loadBatched` was broken dead code**: it used the removed `std.ArrayList.init` API and the old `Value.clone()`/`Value.deinit()` signatures, and had a malformed double-`!` return type. It now compiles and passes a fast-path test.
@@ -92,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Full custom directive support: schema declaration, validation, and execution pipeline
-- Query Plan Cache for pre-validated execution plans
+- Query Plan Cache (parsed-AST cache; opt-in library API, not wired into the server pipeline)
 - Distributed tracing integration with OpenTelemetry-compatible span propagation
 - Auto-generated API documentation from introspection (`DocGenerator`)
 

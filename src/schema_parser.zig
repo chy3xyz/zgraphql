@@ -2,12 +2,14 @@ const std = @import("std");
 const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("lexer.zig").Token;
 const schema = @import("schema.zig");
+const Value = @import("value.zig").Value;
 
 pub const SchemaParseError = error{
     UnexpectedToken,
     MissingQueryType,
     UnexpectedCharacter,
     UnterminatedString,
+    InvalidConstValue,
     InvalidEscape,
     InvalidCharacterInString,
     InvalidNumber,
@@ -63,6 +65,16 @@ pub const SchemaParser = struct {
         var mutation_type_name: ?[]const u8 = null;
         var subscription_type_name: ?[]const u8 = null;
 
+        var directives = std.StringHashMap(schema.DirectiveDefinition).init(self.allocator);
+        defer {
+            var diter = directives.iterator();
+            while (diter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            directives.deinit();
+        }
+
         while (self.current.kind != .eof) {
             if (self.current.isKeyword("schema")) {
                 try self.parseSchemaDefinition(&query_type_name, &mutation_type_name, &subscription_type_name);
@@ -84,6 +96,8 @@ pub const SchemaParser = struct {
             } else if (self.current.isKeyword("scalar")) {
                 const typ = try self.parseScalarType();
                 try types.put(typ.name, typ);
+            } else if (self.current.isKeyword("directive")) {
+                try self.parseDirectiveDefinition(&directives);
             } else {
                 return error.UnexpectedToken;
             }
@@ -104,6 +118,15 @@ pub const SchemaParser = struct {
         if (subscription_type_name) |name| {
             if (types.get(name)) |st| schema_def.subscription_type = st;
         }
+
+        // Move custom directives into the schema (transfer ownership). The
+        // local `directives` map is then cleared so its defer does not free
+        // key/value pairs now owned by schema_def.directives.
+        var diter = directives.iterator();
+        while (diter.next()) |entry| {
+            try schema_def.directives.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+        directives.clearRetainingCapacity();
 
         return schema_def;
     }
@@ -315,6 +338,67 @@ pub const SchemaParser = struct {
         return typ;
     }
 
+    /// Parse a directive definition:
+    ///   directive @name(args) [repeatable] on LOCATION | LOCATION
+    fn parseDirectiveDefinition(self: *SchemaParser, directives: *std.StringHashMap(schema.DirectiveDefinition)) SchemaParseError!void {
+        try self.expectKeyword("directive");
+        try self.expect(.at);
+        const name = try self.expectName();
+
+        var def = schema.DirectiveDefinition.init(self.allocator, name);
+        errdefer def.deinit(self.allocator);
+
+        // Arguments
+        if (self.check(.lparen)) {
+            try self.advance();
+            while (!self.check(.rparen)) {
+                const arg_name = try self.expectName();
+                try self.expect(.colon);
+                const arg_type = try self.parseTypeRef();
+                var default_value: ?Value = null;
+                if (self.check(.equals)) {
+                    try self.advance();
+                    default_value = try self.parseConstValue();
+                }
+                const input_val = schema.InputValue{
+                    .name = arg_name,
+                    .value_type = arg_type,
+                    .default_value = default_value,
+                };
+                try def.arguments.put(try self.allocator.dupe(u8, arg_name), input_val);
+                if (self.check(.rparen)) break;
+            }
+            try self.expect(.rparen);
+        }
+
+        // Optional `repeatable`
+        if (self.current.isKeyword("repeatable")) {
+            def.is_repeatable = true;
+            try self.advance();
+        }
+
+        // `on` + locations
+        try self.expectKeyword("on");
+        if (self.check(.pipe)) try self.advance();
+        while (true) {
+            const loc_name = try self.expectName();
+            // SDL uses SCREAMING_SNAKE_CASE (e.g. FIELD_DEFINITION); the enum
+            // is snake_case, so normalize before converting.
+            var lower_buf: [64]u8 = undefined;
+            if (loc_name.len > lower_buf.len) return error.UnexpectedToken;
+            const lower = std.ascii.lowerString(&lower_buf, loc_name);
+            const loc = std.meta.stringToEnum(schema.DirectiveLocation, lower) orelse return error.UnexpectedToken;
+            try def.locations.append(loc);
+            if (self.check(.pipe)) {
+                try self.advance();
+                continue;
+            }
+            break;
+        }
+
+        try directives.put(try self.allocator.dupe(u8, name), def);
+    }
+
     fn parseFieldDefinition(self: *SchemaParser) SchemaParseError!schema.Field {
         const name = try self.expectName();
 
@@ -328,9 +412,15 @@ pub const SchemaParser = struct {
                 const arg_name = try self.expectName();
                 try self.expect(.colon);
                 const arg_type = try self.parseTypeRef();
+                var default_value: ?Value = null;
+                if (self.check(.equals)) {
+                    try self.advance();
+                    default_value = try self.parseConstValue();
+                }
                 const input_val = schema.InputValue{
                     .name = arg_name,
                     .value_type = arg_type,
+                    .default_value = default_value,
                 };
                 try field.arguments.put(try self.allocator.dupe(u8, arg_name), input_val);
                 if (self.check(.rparen)) break;
@@ -341,7 +431,97 @@ pub const SchemaParser = struct {
         try self.expect(.colon);
         field.field_type = try self.parseTypeRef();
 
+        // Directives on the field definition (e.g. @deprecated)
+        while (self.check(.at)) {
+            try self.parseFieldDirective(&field);
+        }
+
         return field;
+    }
+
+    /// Parse a directive on a field definition (e.g. @deprecated(reason: "...")).
+    fn parseFieldDirective(self: *SchemaParser, field: *schema.Field) SchemaParseError!void {
+        try self.expect(.at);
+        const name = try self.expectName();
+        var args = std.StringHashMap(Value).init(self.allocator);
+        defer {
+            var iter = args.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(self.allocator);
+            }
+            args.deinit();
+        }
+        if (self.check(.lparen)) {
+            try self.advance();
+            while (!self.check(.rparen)) {
+                const arg_name = try self.expectName();
+                try self.expect(.colon);
+                const arg_value = try self.parseConstValue();
+                try args.put(try self.allocator.dupe(u8, arg_name), arg_value);
+                if (self.check(.rparen)) break;
+            }
+            try self.expect(.rparen);
+        }
+        if (std.mem.eql(u8, name, "deprecated")) {
+            if (args.get("reason")) |reason| {
+                field.deprecation_reason = try self.allocator.dupe(u8, reason.data.string);
+            } else {
+                field.deprecation_reason = try self.allocator.dupe(u8, "No longer supported");
+            }
+        }
+    }
+
+    /// Parse a constant (variable-free) value literal into a schema.Value.
+    fn parseConstValue(self: *SchemaParser) SchemaParseError!Value {
+        switch (self.current.kind) {
+            .int => {
+                const v = std.fmt.parseInt(i64, self.current.text, 10) catch return error.InvalidConstValue;
+                try self.advance();
+                return Value.fromInt(self.allocator, v);
+            },
+            .float => {
+                const v = std.fmt.parseFloat(f64, self.current.text) catch return error.InvalidConstValue;
+                try self.advance();
+                return Value.fromFloat(self.allocator, v);
+            },
+            .string, .block_string => {
+                const text = try self.allocator.dupe(u8, self.current.text);
+                try self.advance();
+                return Value.fromString(self.allocator, text);
+            },
+            .name => {
+                const text = self.current.text;
+                try self.advance();
+                if (std.mem.eql(u8, text, "true")) return Value.fromBool(self.allocator, true);
+                if (std.mem.eql(u8, text, "false")) return Value.fromBool(self.allocator, false);
+                if (std.mem.eql(u8, text, "null")) return Value.fromNull(self.allocator);
+                return Value.fromEnum(self.allocator, try self.allocator.dupe(u8, text));
+            },
+            .lbracket => {
+                try self.advance();
+                var list = Value.initList(self.allocator);
+                errdefer list.deinit(self.allocator);
+                while (!self.check(.rbracket)) {
+                    try list.data.list.append(try self.parseConstValue());
+                }
+                try self.expect(.rbracket);
+                return list;
+            },
+            .lbrace => {
+                try self.advance();
+                var obj = Value.initObject(self.allocator);
+                errdefer obj.deinit(self.allocator);
+                while (!self.check(.rbrace)) {
+                    const key = try self.expectName();
+                    try self.expect(.colon);
+                    try obj.data.object.put(try self.allocator.dupe(u8, key), try self.parseConstValue());
+                }
+                try self.expect(.rbrace);
+                return obj;
+            },
+            else => return error.InvalidConstValue,
+        }
     }
 
     fn parseTypeRef(self: *SchemaParser) SchemaParseError!schema.TypeRef {
@@ -518,4 +698,48 @@ test "schema parser list and non-null" {
     try std.testing.expect(users_field.field_type.isNonNull());
     try std.testing.expect(users_field.field_type.kind.non_null.*.isList());
     try std.testing.expect(users_field.field_type.kind.non_null.*.kind.list.*.isNonNull());
+}
+
+test "schema parser directive definition and arg default" {
+    const allocator = std.testing.allocator;
+    const sdl =
+        \\schema { query: Query }
+        \\directive @auth(role: String = "user") on FIELD_DEFINITION | OBJECT
+        \\type Query {
+        \\  hello(name: String = "world"): String
+        \\}
+    ;
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var s = try parser.parseSchema();
+    defer s.deinit();
+
+    // Custom directive registered
+    try std.testing.expect(s.getDirective("auth") != null);
+    const d = s.getDirective("auth").?;
+    try std.testing.expectEqual(@as(usize, 2), d.locations.items.len);
+
+    // Argument default value parsed
+    const field = s.query_type.getField("hello").?;
+    const name_arg = field.arguments.get("name").?;
+    try std.testing.expect(name_arg.default_value != null);
+    try std.testing.expectEqualStrings("world", name_arg.default_value.?.data.string);
+}
+
+test "schema parser field deprecation" {
+    const allocator = std.testing.allocator;
+    const sdl =
+        \\schema { query: Query }
+        \\type Query {
+        \\  old: String @deprecated(reason: "use new")
+        \\}
+    ;
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var s = try parser.parseSchema();
+    defer s.deinit();
+
+    const field = s.query_type.getField("old").?;
+    try std.testing.expect(field.deprecation_reason != null);
+    try std.testing.expectEqualStrings("use new", field.deprecation_reason.?);
 }

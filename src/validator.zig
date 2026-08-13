@@ -103,6 +103,10 @@ pub const Validator = struct {
             validated_fragments.deinit();
         }
 
+        // Operation-level rules: UniqueOperationNames (§5.2.1.1) and
+        // LoneAnonymousOperation (§5.2.2.1).
+        try self.validateOperationNames(doc);
+
         for (doc.definitions.items) |*def| {
             switch (def.*) {
                 .operation => |*op| try self.validateOperation(op, &validated_fragments),
@@ -110,7 +114,104 @@ pub const Validator = struct {
             }
         }
 
+        // NoUnusedFragments (§5.5.1.4): every fragment must be reachable from
+        // at least one operation.
+        try self.validateUnusedFragments(doc);
+
         return self.result;
+    }
+
+    /// §5.2.1.1 UniqueOperationNames + §5.2.2.1 LoneAnonymousOperation.
+    fn validateOperationNames(self: *Validator, doc: *ast.Document) ValidateError!void {
+        var op_names = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iter = op_names.keyIterator();
+            while (iter.next()) |k| self.allocator.free(k.*);
+            op_names.deinit();
+        }
+
+        var op_count: usize = 0;
+        var has_anonymous = false;
+        for (doc.definitions.items) |*def| {
+            switch (def.*) {
+                .operation => |*op| {
+                    op_count += 1;
+                    if (op.name) |name| {
+                        if (op_names.contains(name)) {
+                            try self.result.addError("Operation name must be unique", op.line, op.col);
+                        } else {
+                            try op_names.put(try self.allocator.dupe(u8, name), {});
+                        }
+                    } else {
+                        has_anonymous = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // LoneAnonymousOperation: an anonymous operation must be the only
+        // operation in the document.
+        if (has_anonymous and op_count > 1) {
+            for (doc.definitions.items) |*def| {
+                switch (def.*) {
+                    .operation => |*op| {
+                        if (op.name == null) {
+                            try self.result.addError("An anonymous operation must be the only defined operation", op.line, op.col);
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    /// §5.5.1.4 NoUnusedFragments: every fragment must be reachable from at
+    /// least one operation (directly or transitively).
+    fn validateUnusedFragments(self: *Validator, doc: *ast.Document) ValidateError!void {
+        var used = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iter = used.keyIterator();
+            while (iter.next()) |k| self.allocator.free(k.*);
+            used.deinit();
+        }
+
+        // Mark fragments reachable from operations (transitively).
+        for (doc.definitions.items) |*def| {
+            switch (def.*) {
+                .operation => |*op| try self.markUsedFragments(&op.selection_set, &used),
+                else => {},
+            }
+        }
+
+        for (doc.definitions.items) |*def| {
+            switch (def.*) {
+                .fragment => |*frag| {
+                    if (!used.contains(frag.name)) {
+                        try self.result.addError("Fragment is never used", frag.line, frag.col);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn markUsedFragments(self: *Validator, ss: *ast.SelectionSet, used: *std.StringHashMap(void)) ValidateError!void {
+        for (ss.selections.items) |*sel| {
+            switch (sel.*) {
+                .fragment_spread => |*fs| {
+                    if (used.contains(fs.name)) continue;
+                    try used.put(try self.allocator.dupe(u8, fs.name), {});
+                    if (self.fragments.get(fs.name)) |frag| {
+                        try self.markUsedFragments(&frag.selection_set, used);
+                    }
+                },
+                .inline_fragment => |*ifrag| try self.markUsedFragments(&ifrag.selection_set, used),
+                .field => |*field| {
+                    if (field.selection_set) |*fss| try self.markUsedFragments(fss, used);
+                },
+            }
+        }
     }
 
     fn detectFragmentCycles(self: *Validator, frag_name: []const u8, frag: *ast.FragmentDefinition, visited: *std.StringHashMap(void)) ValidateError!void {
@@ -171,6 +272,17 @@ pub const Validator = struct {
                 var_type.* = try self.convertTypeRef(&vd.var_type);
                 try self.variables.put(vd.name, var_type);
             }
+
+            // §5.8.2 VariablesAreInputTypes: the variable's named type must be
+            // an input type (scalar, enum, or input object).
+            try self.validateVariableType(vd);
+
+            // Variable default values must be constant (no variable references).
+            if (vd.default_value) |*dv| {
+                if (try self.astValueContainsVariable(dv)) {
+                    try self.result.addError("Variable default value must be constant", op.line, null);
+                }
+            }
         }
 
         const op_location: schema.DirectiveLocation = switch (op.op_type) {
@@ -190,8 +302,138 @@ pub const Validator = struct {
         self.variables.clearRetainingCapacity();
     }
 
-    fn validateFragment(self: *Validator, frag: *ast.FragmentDefinition, validated_fragments: *std.StringHashMap(void)) !void {
-        const type_name = frag.type_condition.name;
+    /// §5.8.2 VariablesAreInputTypes: unwrap the variable type and verify the
+    /// named type is an input type.
+    fn validateVariableType(self: *Validator, vd: *ast.VariableDefinition) ValidateError!void {
+        var t = &vd.var_type;
+        while (true) {
+            switch (t.*) {
+                .named => |n| {
+                    const schema_type = self.schema_def.getType(n.name);
+                    if (schema_type == null) {
+                        try self.result.addError("Variable type does not exist in schema", null, null);
+                    } else if (!schema_type.?.isInputType()) {
+                        try self.result.addError("Variable type must be an input type", null, null);
+                    }
+                    return;
+                },
+                .list => |inner| t = inner,
+                .non_null => |inner| t = inner,
+            }
+        }
+    }
+
+    /// Returns true if the AST value contains a variable reference anywhere.
+    fn astValueContainsVariable(self: *Validator, value: *ast.AstValue) ValidateError!bool {
+        switch (value.*) {
+            .variable => return true,
+            .list_value => |*list| {
+                for (list.items) |*item| {
+                    if (try self.astValueContainsVariable(item)) return true;
+                }
+                return false;
+            },
+            .object_value => |*obj| {
+                var iter = obj.iterator();
+                while (iter.next()) |entry| {
+                    if (try self.astValueContainsVariable(entry.value_ptr)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// §5.3.2 OverlappingFieldsCanBeMerged: collect fields by response key and
+    /// verify that fields with the same key target the same schema field with
+    /// identical arguments.
+    fn validateFieldMerging(self: *Validator, ss: *ast.SelectionSet) ValidateError!void {
+        // Map response key -> first field (name + argument signature).
+        var seen = std.StringHashMap(FieldSig).init(self.allocator);
+        defer {
+            var iter = seen.keyIterator();
+            while (iter.next()) |k| self.allocator.free(k.*);
+            seen.deinit();
+        }
+
+        for (ss.selections.items) |*sel| {
+            switch (sel.*) {
+                .field => |*field| {
+                    const key = field.alias orelse field.name;
+                    const sig = FieldSig{
+                        .field_name = field.name,
+                        .args = field.arguments.items,
+                    };
+                    if (seen.get(key)) |existing| {
+                        if (!std.mem.eql(u8, existing.field_name, sig.field_name)) {
+                            try self.result.addError("Fields with the same response key must target the same field", field.line, field.col);
+                        } else if (!self.argsEqual(existing.args, sig.args)) {
+                            try self.result.addError("Fields with the same response key must have identical arguments", field.line, field.col);
+                        }
+                    } else {
+                        try seen.put(try self.allocator.dupe(u8, key), sig);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    const FieldSig = struct {
+        field_name: []const u8,
+        args: []const ast.Argument,
+    };
+
+    fn argsEqual(self: *Validator, a: []const ast.Argument, b: []const ast.Argument) bool {
+        if (a.len != b.len) return false;
+        // Compare as a multiset by name+value.
+        var matched = std.DynamicBitSetUnmanaged.initEmpty(self.allocator, b.len) catch return false;
+        defer matched.deinit(self.allocator);
+        for (a) |arg_a| {
+            var found = false;
+            for (b, 0..) |arg_b, j| {
+                if (matched.isSet(j)) continue;
+                if (std.mem.eql(u8, arg_a.name, arg_b.name) and self.astValueEqual(&arg_a.value, &arg_b.value)) {
+                    matched.set(j);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    fn astValueEqual(self: *Validator, a: *const ast.AstValue, b: *const ast.AstValue) bool {
+        if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+        return switch (a.*) {
+            .variable => |v| std.mem.eql(u8, v, b.variable),
+            .int_value => |v| std.mem.eql(u8, v, b.int_value),
+            .float_value => |v| std.mem.eql(u8, v, b.float_value),
+            .string_value => |v| std.mem.eql(u8, v, b.string_value),
+            .boolean_value => |v| v == b.boolean_value,
+            .null_value => true,
+            .enum_value => |v| std.mem.eql(u8, v, b.enum_value),
+            .list_value => |v| {
+                if (v.items.len != b.list_value.items.len) return false;
+                for (v.items, b.list_value.items) |x, y| {
+                    if (!self.astValueEqual(&x, &y)) return false;
+                }
+                return true;
+            },
+            .object_value => |v| {
+                if (v.count() != b.object_value.count()) return false;
+                var iter = v.iterator();
+                while (iter.next()) |entry| {
+                    const other = b.object_value.get(entry.key_ptr.*) orelse return false;
+                    if (!self.astValueEqual(entry.value_ptr, &other)) return false;
+                }
+                return true;
+            },
+        };
+    }
+
+    fn validateFragment(self: *Validator, frag: *ast.FragmentDefinition, validated_fragments: *std.StringHashMap(void)) !void {        const type_name = frag.type_condition.name;
         const frag_type = self.schema_def.getType(type_name);
         if (frag_type == null) {
             try self.result.addError("Fragment type condition does not exist in schema", frag.line, frag.col);
@@ -217,6 +459,10 @@ pub const Validator = struct {
             try self.result.addError("Selection set must not be empty on composite type", null, null);
             return;
         }
+
+        // §5.3.2 OverlappingFieldsCanBeMerged: fields sharing a response key
+        // must have the same target field and identical arguments.
+        try self.validateFieldMerging(ss);
 
         for (ss.selections.items) |*sel| {
             switch (sel.*) {
@@ -1225,4 +1471,84 @@ test "validator validates introspection __type sub-selection" {
     defer doc.deinit();
     const result = try validator.validate(&doc);
     try std.testing.expect(result.isValid());
+}
+
+test "validator unique operation names" {
+    const allocator = std.testing.allocator;
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), schema.Field.init(allocator, "hello", schema.TypeRef.named("String")));
+    var schema_def = try schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    var parser = try @import("parser.zig").Parser.init(allocator, "query A { hello } query A { hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator lone anonymous operation" {
+    const allocator = std.testing.allocator;
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), schema.Field.init(allocator, "hello", schema.TypeRef.named("String")));
+    var schema_def = try schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    var parser = try @import("parser.zig").Parser.init(allocator, "{ hello } query A { hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator unused fragment" {
+    const allocator = std.testing.allocator;
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), schema.Field.init(allocator, "hello", schema.TypeRef.named("String")));
+    var schema_def = try schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    var parser = try @import("parser.zig").Parser.init(allocator, "{ hello } fragment Unused on Query { hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
+}
+
+test "validator variable must be input type" {
+    const allocator = std.testing.allocator;
+    const query_type = try allocator.create(schema.Type);
+    query_type.* = .{ .name = "Query", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), schema.Field.init(allocator, "hello", schema.TypeRef.named("String")));
+    // Register an object type (not an input type).
+    const obj_type = try allocator.create(schema.Type);
+    obj_type.* = .{ .name = "Obj", .kind = .{ .object = schema.ObjectType.init(allocator) } };
+    var schema_def = try schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+    try schema_def.registerType("Obj", obj_type);
+
+    var validator = Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    var parser = try @import("parser.zig").Parser.init(allocator, "query Q($v: Obj) { hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+    const result = try validator.validate(&doc);
+    try std.testing.expect(!result.isValid());
 }

@@ -9,6 +9,7 @@ const Parser = @import("parser.zig").Parser;
 const Executor = @import("executor.zig").Executor;
 
 const GraphQLServer = server.GraphQLServer;
+const Tenant = @import("tenant.zig").Tenant;
 const Io = std.Io;
 const http = std.http;
 const log = std.log.scoped(.zgraphql_server);
@@ -162,7 +163,7 @@ pub fn consumeSubscription(
 }
 
 /// Handle WebSocket connection using graphql-ws protocol.
-pub fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket) !void {
+pub fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket, tenant: ?*Tenant) !void {
     // Wait for connection_init
     const init_msg_data = readWebSocketMessage(self.allocator, ws, self.options.max_websocket_message_size) catch |err| switch (err) {
         error.ConnectionClose => return,
@@ -350,7 +351,7 @@ pub fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket)
             }
 
             // Non-subscription: single-shot execution
-            const result = server.executeGraphQLAndGetJson(self, io, query, operation_name, &variables, null) catch |err| {
+            const result = server.executeGraphQLAndGetJson(self, io, query, operation_name, &variables, tenant) catch |err| {
                 log.err("websocket execution error: {s}", .{@errorName(err)});
                 const err_json = try server.buildErrorJson(self.allocator, "Internal error");
                 defer self.allocator.free(err_json);
@@ -382,6 +383,12 @@ pub fn handleWebSocket(self: *GraphQLServer, io: Io, ws: *http.Server.WebSocket)
                 _ = active_subs.remove(id);
             }
             continue;
+        }
+
+        // connection_terminate: client requests immediate disconnect. The
+        // defer at the top of this function cancels all active subscriptions.
+        if (std.mem.eql(u8, msg_type, "connection_terminate")) {
+            return;
         }
     }
 }

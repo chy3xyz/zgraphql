@@ -216,6 +216,10 @@ pub const Type = struct {
         return self.kind == .input_object;
     }
 
+    pub fn isInputType(self: Type) bool {
+        return self.isScalar() or self.isEnum() or self.isInputObject();
+    }
+
     pub fn isComposite(self: Type) bool {
         return self.isObject() or self.isInterface() or self.isUnion();
     }
@@ -394,6 +398,7 @@ pub const Field = struct {
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         self.field_type.deinit(allocator);
+        if (self.deprecation_reason) |r| allocator.free(r);
         var iter = self.arguments.iterator();
         while (iter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
