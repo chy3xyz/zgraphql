@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`HttpCacheBackend.setImpl`/`deleteImpl` swallowed non-2xx status**: the HTTP status from `client.fetch` was discarded, so a failed cache write (404/500/503) silently reported success. Non-2xx now returns `error.CacheWriteFailed`.
+- **Subscription allocator contract documented + asserted**: `SubscriptionStream.next` results from `Executor.executeSubscription` must use the Executor's allocator; a debug-mode assertion now catches a mismatch instead of corrupting the heap silently.
 - **`DataLoader.loadBatched` was broken dead code**: it used the removed `std.ArrayList.init` API and the old `Value.clone()`/`Value.deinit()` signatures, and had a malformed double-`!` return type. It now compiles and passes a fast-path test.
 - **`DistributedCache.setValue` was broken dead code**: it accessed the removed `value.allocator` field and called `value.toJson()` without an allocator. Now uses `self.allocator`.
 - **`ResponseCache.prune` / `QueryPlanCache.prune` / `RateLimiter.prune` were broken dead code**: `std.ArrayList.init` + `try dupe` in a `void` function (would not compile). Now use `std.array_list.Managed` and degrade gracefully on OOM.

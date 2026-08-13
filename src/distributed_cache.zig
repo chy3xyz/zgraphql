@@ -201,11 +201,12 @@ pub const HttpCacheBackend = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}?ttl={d}", .{ self.base_url, key, ttl_ms });
         defer allocator.free(url);
 
-        _ = try self.client.fetch(.{
+        const result = try self.client.fetch(.{
             .location = .{ .url = url },
             .method = .PUT,
             .payload = value,
         });
+        if (result.status.class() != .success) return error.CacheWriteFailed;
     }
 
     fn deleteImpl(ctx: ?*anyopaque, allocator: std.mem.Allocator, key: []const u8) !void {
@@ -213,10 +214,11 @@ pub const HttpCacheBackend = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_url, key });
         defer allocator.free(url);
 
-        _ = try self.client.fetch(.{
+        const result = try self.client.fetch(.{
             .location = .{ .url = url },
             .method = .DELETE,
         });
+        if (result.status.class() != .success) return error.CacheWriteFailed;
     }
 };
 

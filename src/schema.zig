@@ -342,6 +342,7 @@ pub const SubscriptionStream = struct {
     pub const VTable = struct {
         /// Block until the next event is available, or return null if the stream has ended.
         /// The returned Value should be treated as a "parent" value for the subscription field.
+        /// The returned Value must be allocated with `allocator`.
         next: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) anyerror!?Value,
         /// Clean up the stream and any associated resources.
         deinit: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
@@ -350,6 +351,10 @@ pub const SubscriptionStream = struct {
         cancel: ?*const fn (ptr: *anyopaque) void = null,
     };
 
+    /// Returns the next event Value, allocated with `allocator`. For streams
+    /// produced by `Executor.executeSubscription`, `allocator` MUST be the
+    /// same allocator the Executor was created with (the executor builds
+    /// sub-selection results with its own allocator).
     pub fn next(self: SubscriptionStream, allocator: std.mem.Allocator) !?Value {
         return self.vtable.next(self.ptr, allocator);
     }
