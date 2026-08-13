@@ -361,9 +361,9 @@ pub const SubscriptionStream = struct {
     };
 
     /// Returns the next event Value, allocated with `allocator`. For streams
-    /// produced by `Executor.executeSubscription`, `allocator` MUST be the
-    /// same allocator the Executor was created with (the executor builds
-    /// sub-selection results with its own allocator).
+    /// produced by `Executor.executeSubscription`, the returned Value tree is
+    /// uniformly owned by `allocator` (sub-selection results are cloned into
+    /// it), so any allocator may be used consistently for `next`/`deinit`.
     pub fn next(self: SubscriptionStream, allocator: std.mem.Allocator) !?Value {
         return self.vtable.next(self.ptr, allocator);
     }

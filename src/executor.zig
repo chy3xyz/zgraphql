@@ -429,15 +429,6 @@ pub const Executor = struct {
         const ctx = @as(*SubscriptionContext, @ptrCast(@alignCast(ptr)));
         if (ctx.cancelled.load(.seq_cst)) return null;
 
-        // The selection-set results below are built with the Executor's own
-        // allocator, so the returned Value tree is owned by that allocator.
-        // Callers must therefore pass the Executor's allocator to `next()` and
-        // `deinit()` (the subscription path in server_ws.zig does exactly this).
-        if (std.debug.runtime_safety) {
-            std.debug.assert(allocator.ptr == ctx.executor.allocator.ptr and
-                allocator.vtable == ctx.executor.allocator.vtable);
-        }
-
         var parent_value = try ctx.inner.next(allocator) orelse return null;
 
         // Execute the selection set for this subscription event
@@ -452,9 +443,16 @@ pub const Executor = struct {
                 };
                 parent_value.deinit(allocator);
 
+                // The selection-set result was built with the Executor's own
+                // allocator; clone it into the caller's allocator so the whole
+                // returned Value tree is uniformly owned by `allocator`.
+                const data_owned = try data.clone(allocator);
+                var data_mut = data;
+                data_mut.deinit(ctx.executor.allocator);
+
                 var result = Value.initObject(allocator);
                 errdefer result.deinit(allocator);
-                try result.data.object.put(try allocator.dupe(u8, "data"), data);
+                try result.data.object.put(try allocator.dupe(u8, "data"), data_owned);
 
                 if (ctx.executor.errors.items.len > 0) {
                     var errors_list = Value.initList(allocator);
