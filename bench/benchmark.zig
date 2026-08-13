@@ -91,7 +91,7 @@ fn buildQuerySchema(allocator: std.mem.Allocator) !zg.schema.Schema {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     try schema_def.registerType("Query", query_type);
     return schema_def;
 }
@@ -179,6 +179,33 @@ pub fn main() !void {
 
     const e2e_result = try runBenchmark("End-to-end (parse+validate+execute+json)", io, iterations, benchEndToEnd, allocator);
     e2e_result.print();
+
+    // Emit machine-readable JSON so CI can record and diff results over time.
+    var json_buf: [4096]u8 = undefined;
+    const json_str = std.fmt.bufPrint(&json_buf,
+        "{{\"parse_ns\":{d},\"validate_ns\":{d},\"execute_ns\":{d},\"e2e_ns\":{d}}}",
+        .{
+            @as(u64, @intFromFloat(parse_result.avg_ns)),
+            @as(u64, @intFromFloat(validate_result.avg_ns)),
+            @as(u64, @intFromFloat(execute_result.avg_ns)),
+            @as(u64, @intFromFloat(e2e_result.avg_ns)),
+        },
+    ) catch "{}";
+    std.debug.print("\nBENCHMARK_JSON={s}\n", .{json_str});
+
+    // Catastrophic-regression smoke check: if any phase averages more than
+    // 100 ms per iteration (indicating a hang or pathological slowdown), fail.
+    // This is intentionally very loose — it only catches order-of-magnitude
+    // regressions, not fine-grained drift.
+    const max_ns: f64 = 100.0 * std.time.ns_per_ms;
+    if (parse_result.avg_ns > max_ns or
+        validate_result.avg_ns > max_ns or
+        execute_result.avg_ns > max_ns or
+        e2e_result.avg_ns > max_ns)
+    {
+        std.debug.print("error: benchmark exceeded the 100ms/iter sanity threshold\n", .{});
+        return error.BenchmarkRegression;
+    }
 
     std.debug.print("\n", .{});
 }

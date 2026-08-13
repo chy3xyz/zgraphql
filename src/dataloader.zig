@@ -61,13 +61,14 @@ pub const DataLoader = struct {
         self.batch_ctx = batch_ctx;
     }
 
-    /// Check cache for a key. Returns a cloned value or null.
-    pub fn load(self: *DataLoader, key: []const u8) ?Value {
-        self.mutex.lock(self.io) catch return null;
+    /// Check cache for a key. Returns a cloned value or null on a cache miss.
+    /// Caller owns the returned value and must deinit it.
+    pub fn load(self: *DataLoader, key: []const u8) anyerror!?Value {
+        self.mutex.lock(self.io) catch |err| return err;
         defer self.mutex.unlock(self.io);
 
         if (self.cache.get(key)) |v| {
-            return v.clone() catch null;
+            return try v.clone();
         }
         return null;
     }
@@ -151,7 +152,7 @@ pub const DataLoader = struct {
     /// Returns error.BatchLoadFailed if the key could not be resolved.
     pub fn loadBatched(self: *DataLoader, key: []const u8) !(error{ NoBatchFunction, BatchLoadFailed, Canceled } || std.mem.Allocator.Error)!Value {
         // Fast path: already cached
-        if (self.load(key)) |v| return v;
+        if (try self.load(key)) |v| return v;
 
         const batch_fn = self.batch_fn orelse return error.NoBatchFunction;
 
@@ -210,7 +211,7 @@ pub const DataLoader = struct {
             }
         }
 
-        if (self.load(key)) |v| return v;
+        if (try self.load(key)) |v| return v;
         return error.BatchLoadFailed;
     }
 
@@ -242,12 +243,12 @@ test "dataloader cache" {
     try dl.prime("key1", val);
 
     // Load from cache
-    var loaded = dl.load("key1").?;
+    var loaded = (try dl.load("key1")).?;
     defer loaded.deinit();
     try std.testing.expectEqualStrings("hello", loaded.data.string);
 
     // Missing key
-    try std.testing.expect(dl.load("missing") == null);
+    try std.testing.expect((try dl.load("missing")) == null);
 }
 
 test "dataloader loadMany" {

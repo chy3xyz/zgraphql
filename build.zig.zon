@@ -1,6 +1,6 @@
 .{
     .name = .zgraphql,
-    .version = "0.4.1",
+    .version = "0.5.0",
     .fingerprint = 0xabc08dad1645136f,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

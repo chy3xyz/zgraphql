@@ -27,7 +27,9 @@ pub const Parser = struct {
         errdefer doc.deinit();
 
         while (self.current.kind != .eof) {
-            try doc.definitions.append(try self.parseDefinition());
+            var def = try self.parseDefinition();
+            errdefer def.deinit(self.allocator);
+            try doc.definitions.append(def);
         }
         return doc;
     }
@@ -152,7 +154,9 @@ pub const Parser = struct {
         errdefer ss.deinit(self.allocator);
         try self.expect(.lbrace);
         while (self.current.kind != .rbrace) {
-            try ss.selections.append(try self.parseSelection());
+            var sel = try self.parseSelection();
+            errdefer sel.deinit(self.allocator);
+            try ss.selections.append(sel);
         }
         try self.expect(.rbrace);
         return ss;
@@ -451,4 +455,17 @@ test "parser duplicate object field" {
     );
     defer parser.deinit();
     try std.testing.expectError(error.DuplicateField, parser.parseDocument());
+}
+
+test "parser OOM: every allocation failure is handled" {
+    const source = "{ user(id: 1) { name friends { name } } }";
+    const run = struct {
+        fn impl(allocator: std.mem.Allocator) !void {
+            var parser = try Parser.init(allocator, source);
+            defer parser.deinit();
+            var doc = try parser.parseDocument();
+            doc.deinit();
+        }
+    }.impl;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, run, .{});
 }

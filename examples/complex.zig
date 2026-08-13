@@ -386,7 +386,7 @@ fn orderToValue(alloc: std.mem.Allocator, o: OrderRecord, app: *AppContext) !zg.
     var items = zg.Value.initList(alloc);
     for (o.items) |item| {
         var item_obj = zg.Value.initObject(alloc);
-        if (app.product_dl.load(try std.fmt.allocPrint(alloc, "{d}", .{item.product_id}))) |pv| {
+        if (try app.product_dl.load(try std.fmt.allocPrint(alloc, "{d}", .{item.product_id}))) |pv| {
             try item_obj.data.object.put(try alloc.dupe(u8, "product"), pv);
         } else if (app.db.getProduct(item.product_id)) |pr| {
             try item_obj.data.object.put(try alloc.dupe(u8, "product"), try productToValue(alloc, pr));
@@ -430,7 +430,7 @@ fn userResolver(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, args: s
     // Try DataLoader cache first
     var key_buf: [32]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{d}", .{id});
-    if (app.user_dl.load(key)) |cached| {
+    if (try app.user_dl.load(key)) |cached| {
         return cached;
     }
 
@@ -461,7 +461,7 @@ fn postResolver(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, args: s
 
     var key_buf: [32]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{d}", .{id});
-    if (app.post_dl.load(key)) |cached| {
+    if (try app.post_dl.load(key)) |cached| {
         return cached;
     }
 
@@ -492,7 +492,7 @@ fn productResolver(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, args
 
     var key_buf: [32]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{d}", .{id});
-    if (app.product_dl.load(key)) |cached| {
+    if (try app.product_dl.load(key)) |cached| {
         return cached;
     }
 

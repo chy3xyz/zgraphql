@@ -43,7 +43,7 @@ fn buildSchema(allocator: std.mem.Allocator) !zg.schema.Schema {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "user"), user_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
     return schema_def;

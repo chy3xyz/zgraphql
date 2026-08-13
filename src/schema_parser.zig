@@ -91,7 +91,7 @@ pub const SchemaParser = struct {
 
         // Resolve root types
         const qt = types.get(query_type_name orelse return error.MissingQueryType) orelse return error.MissingQueryType;
-        var schema_def = schema.Schema.init(self.allocator, qt);
+        var schema_def = try schema.Schema.init(self.allocator, qt);
 
         var iter = types.iterator();
         while (iter.next()) |entry| {

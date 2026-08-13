@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-06
+
+### Fixed
+- **Multi-tenant response cache isolation**: the response/distributed cache key was only the query string, so different tenants sharing a global cache could read each other's cached responses. The cache key is now tenant-scoped.
+- **`DataLoader.load` swallowed errors**: lock and clone failures were silently converted to `null` (indistinguishable from a cache miss). `load` now returns `anyerror!?Value` and propagates errors.
+- **OOM leaks across the engine** (found by new `checkAllAllocationFailures` tests):
+  - `Parser.parseDocument`/`parseSelectionSet` leaked successfully parsed values when appending to the list failed.
+  - `Schema.init` used `catch unreachable` for builtin-directive registration, panicking on OOM; it is now `!Schema` and propagates errors.
+  - `registerBuiltinDirectives` lacked `errdefer` cleanup for directive/location/argument allocations.
+  - `Executor` result-building used the `put(try dupe(...), value)` anti-pattern, leaking keys/values on OOM.
+- **`Schema.init` is now fallible** (`!Schema`): OOM during builtin-directive registration no longer panics.
+- **`queryIsQuery` keyword matching**: `queryFoo` no longer matches the `query` keyword; a whole-keyword check is used.
+
+### Changed
+- **Broken import cycle**: `server.zig` no longer imports `zgraphql.zig` (which re-exports it); it now imports internal modules directly, keeping embedded users who don't need the HTTP server out of the module graph.
+- **Playground HTML split** into `src/server_playground.zig`.
+- **`Value.cloneWith(allocator)`** added for cross-allocator cloning (arena/request-scoped reuse); `clone()` now delegates to it.
+
+### Added
+- OOM-injection tests for the parser and executor (every allocation failure is exercised).
+- Concurrent `QueryCache` get/store test.
+- Multi-tenant response-cache isolation test.
+- Cross-allocator `Value.cloneWith` test.
+- Benchmark JSON output (`BENCHMARK_JSON=...`) and a 100ms/iter catastrophic-regression smoke check.
+
 ## [0.4.1] - 2026-08-06
 
 ### Fixed
@@ -88,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
+[0.5.0]: https://github.com/chy3xyz/zgraphql/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/chy3xyz/zgraphql/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/chy3xyz/zgraphql/compare/v0.3.1...v0.4.0
 [0.3.0]: https://github.com/chy3xyz/zgraphql/releases/tag/v0.3.0

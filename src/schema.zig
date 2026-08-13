@@ -59,14 +59,22 @@ pub const Schema = struct {
     types: std.StringHashMap(*Type),
     directives: std.StringHashMap(DirectiveDefinition),
 
-    pub fn init(allocator: std.mem.Allocator, query_type: *Type) Schema {
+    pub fn init(allocator: std.mem.Allocator, query_type: *Type) !Schema {
         var s = Schema{
             .allocator = allocator,
             .query_type = query_type,
             .types = std.StringHashMap(*Type).init(allocator),
             .directives = std.StringHashMap(DirectiveDefinition).init(allocator),
         };
-        s.registerBuiltinDirectives(allocator) catch unreachable;
+        errdefer {
+            var diter = s.directives.iterator();
+            while (diter.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            s.directives.deinit();
+        }
+        try s.registerBuiltinDirectives(allocator);
         return s;
     }
 
@@ -104,26 +112,58 @@ pub const Schema = struct {
 
     fn registerBuiltinDirectives(self: *Schema, allocator: std.mem.Allocator) !void {
         // @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
-        var skip = DirectiveDefinition.init(allocator, "skip");
-        try skip.locations.append(.field);
-        try skip.locations.append(.fragment_spread);
-        try skip.locations.append(.inline_fragment);
-        const skip_bool = try allocator.create(TypeRef);
-        skip_bool.* = TypeRef.named("Boolean");
-        const skip_if = InputValue{ .name = "if", .value_type = TypeRef.nonNull(skip_bool) };
-        try skip.arguments.put(try allocator.dupe(u8, "if"), skip_if);
-        try self.directives.put(try allocator.dupe(u8, "skip"), skip);
+        {
+            var skip = DirectiveDefinition.init(allocator, "skip");
+            var skip_owned = true;
+            defer if (skip_owned) skip.deinit(allocator);
+            try skip.locations.append(.field);
+            try skip.locations.append(.fragment_spread);
+            try skip.locations.append(.inline_fragment);
+            const skip_bool = try allocator.create(TypeRef);
+            var skip_bool_owned = true;
+            defer if (skip_bool_owned) allocator.destroy(skip_bool);
+            skip_bool.* = TypeRef.named("Boolean");
+            const skip_if = InputValue{ .name = "if", .value_type = TypeRef.nonNull(skip_bool) };
+            const skip_if_key = try allocator.dupe(u8, "if");
+            var skip_if_key_owned = true;
+            defer if (skip_if_key_owned) allocator.free(skip_if_key);
+            try skip.arguments.put(skip_if_key, skip_if);
+            skip_if_key_owned = false;
+            skip_bool_owned = false; // now owned by skip (via skip_if.value_type)
+            const skip_key = try allocator.dupe(u8, "skip");
+            var skip_key_owned = true;
+            defer if (skip_key_owned) allocator.free(skip_key);
+            try self.directives.put(skip_key, skip);
+            skip_key_owned = false;
+            skip_owned = false; // now owned by self.directives
+        }
 
         // @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
-        var include = DirectiveDefinition.init(allocator, "include");
-        try include.locations.append(.field);
-        try include.locations.append(.fragment_spread);
-        try include.locations.append(.inline_fragment);
-        const include_bool = try allocator.create(TypeRef);
-        include_bool.* = TypeRef.named("Boolean");
-        const include_if = InputValue{ .name = "if", .value_type = TypeRef.nonNull(include_bool) };
-        try include.arguments.put(try allocator.dupe(u8, "if"), include_if);
-        try self.directives.put(try allocator.dupe(u8, "include"), include);
+        {
+            var include = DirectiveDefinition.init(allocator, "include");
+            var include_owned = true;
+            defer if (include_owned) include.deinit(allocator);
+            try include.locations.append(.field);
+            try include.locations.append(.fragment_spread);
+            try include.locations.append(.inline_fragment);
+            const include_bool = try allocator.create(TypeRef);
+            var include_bool_owned = true;
+            defer if (include_bool_owned) allocator.destroy(include_bool);
+            include_bool.* = TypeRef.named("Boolean");
+            const include_if = InputValue{ .name = "if", .value_type = TypeRef.nonNull(include_bool) };
+            const include_if_key = try allocator.dupe(u8, "if");
+            var include_if_key_owned = true;
+            defer if (include_if_key_owned) allocator.free(include_if_key);
+            try include.arguments.put(include_if_key, include_if);
+            include_if_key_owned = false;
+            include_bool_owned = false; // now owned by include (via include_if.value_type)
+            const include_key = try allocator.dupe(u8, "include");
+            var include_key_owned = true;
+            defer if (include_key_owned) allocator.free(include_key);
+            try self.directives.put(include_key, include);
+            include_key_owned = false;
+            include_owned = false; // now owned by self.directives
+        }
     }
 };
 
@@ -446,7 +486,7 @@ test "schema basic" {
         .kind = .{ .object = ObjectType.init(allocator) },
     };
 
-    var schema = Schema.init(allocator, query_type);
+    var schema = try Schema.init(allocator, query_type);
     defer schema.deinit();
 
     try schema.registerType("Query", query_type);

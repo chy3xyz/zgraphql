@@ -667,7 +667,7 @@ test "validator basic" {
     const name_field = schema.Field.init(allocator, "name", schema.TypeRef.named("String"));
     try user_type.kind.object.fields.put(try allocator.dupe(u8, "name"), name_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
@@ -693,7 +693,7 @@ test "validator invalid field" {
         .kind = .{ .object = schema.ObjectType.init(allocator) },
     };
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -722,7 +722,7 @@ test "validator argument type mismatch" {
     try hello_field.arguments.put(try allocator.dupe(u8, "greeting"), arg);
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -760,7 +760,7 @@ test "validator enum argument" {
     try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "ACTIVE"), .{ .name = "ACTIVE" });
     try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "INACTIVE"), .{ .name = "INACTIVE" });
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Status", status_enum);
@@ -798,7 +798,7 @@ test "validator invalid enum argument" {
     };
     try status_enum.kind.enum_type.values.put(try allocator.dupe(u8, "ACTIVE"), .{ .name = "ACTIVE" });
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Status", status_enum);
@@ -827,7 +827,7 @@ test "validator fragment cycle detection" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -882,7 +882,7 @@ test "validator undefined variable" {
     try hello_field.arguments.put(try allocator.dupe(u8, "name"), .{ .name = "name", .value_type = schema.TypeRef.named("String") });
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -910,7 +910,7 @@ test "validator directive missing if argument" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -938,7 +938,7 @@ test "validator directive invalid if type" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -966,7 +966,7 @@ test "validator valid directive" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -993,7 +993,7 @@ test "validator unknown directive" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1025,7 +1025,7 @@ test "validator directive wrong location" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1058,7 +1058,7 @@ test "validator directive not repeatable" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1162,7 +1162,7 @@ test "validator validates introspection __schema sub-selection" {
     };
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1213,7 +1213,7 @@ test "validator validates introspection __type sub-selection" {
     };
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 

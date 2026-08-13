@@ -78,9 +78,15 @@ pub const Value = struct {
         }
     }
 
-    /// Deep clone a value.
+    /// Deep clone a value using its embedded allocator.
     pub fn clone(self: Value) std.mem.Allocator.Error!Value {
-        const allocator = self.allocator;
+        return self.cloneWith(self.allocator);
+    }
+
+    /// Deep clone a value into a caller-chosen allocator. This enables moving
+    /// values across allocator boundaries (e.g. into an arena or a
+    /// request-scoped allocator) without re-allocating the source.
+    pub fn cloneWith(self: Value, allocator: std.mem.Allocator) std.mem.Allocator.Error!Value {
         switch (self.data) {
             .null => return fromNull(allocator),
             .int => |v| return fromInt(allocator, v),
@@ -92,7 +98,7 @@ pub const Value = struct {
                 var new = initList(allocator);
                 errdefer new.deinit();
                 for (list.items) |item| {
-                    try new.data.list.append(try item.clone());
+                    try new.data.list.append(try item.cloneWith(allocator));
                 }
                 return new;
             },
@@ -103,7 +109,7 @@ pub const Value = struct {
                 while (iter.next()) |entry| {
                     const key = try allocator.dupe(u8, entry.key_ptr.*);
                     errdefer allocator.free(key);
-                    try new.data.object.put(key, try entry.value_ptr.clone());
+                    try new.data.object.put(key, try entry.value_ptr.cloneWith(allocator));
                 }
                 return new;
             },
@@ -392,4 +398,25 @@ test "value fromJson roundtrip" {
 test "value fromJson invalid" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidJson, Value.fromJson(allocator, "not json"));
+}
+
+test "value cloneWith crosses allocator boundary" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var original = Value.initObject(allocator);
+    defer original.deinit();
+    try original.data.object.put(try allocator.dupe(u8, "nested"), Value.initList(allocator));
+    var nested_list = original.data.object.getPtr("nested").?;
+    try nested_list.data.list.append(Value.fromString(allocator, try allocator.dupe(u8, "deep")));
+
+    // Clone into the arena: the clone must be owned by the arena allocator.
+    var cloned = try original.cloneWith(arena_alloc);
+    defer cloned.deinit();
+
+    try std.testing.expect(original.data.object.get("nested").?.data.list.items[0].data.string.ptr !=
+        cloned.data.object.get("nested").?.data.list.items[0].data.string.ptr);
+    try std.testing.expectEqualStrings("deep", cloned.data.object.get("nested").?.data.list.items[0].data.string);
 }

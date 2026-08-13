@@ -150,7 +150,7 @@ fn userResolver(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, args: s
     // Use DataLoader to enable batching / deduplication
     var key_buf: [32]u8 = undefined;
     const key = try std.fmt.bufPrint(&key_buf, "{d}", .{id});
-    if (app.dl.load(key)) |cached| {
+    if (try app.dl.load(key)) |cached| {
         // load() already returns an owned clone; return it directly.
         return cached;
     }

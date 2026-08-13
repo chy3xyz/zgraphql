@@ -17,8 +17,12 @@ pub const schema = @import("schema.zig");
 pub const Validator = @import("validator.zig").Validator;
 pub const ValidationResult = @import("validator.zig").ValidationResult;
 pub const Executor = @import("executor.zig").Executor;
+pub const Context = @import("executor.zig").Context;
+/// Alias kept for backward compatibility; prefer `Context`.
 pub const ExecutionContext = @import("executor.zig").Context;
 pub const ExecutionHooks = @import("executor.zig").ExecutionHooks;
+pub const GraphQLError = @import("executor.zig").GraphQLError;
+pub const SubscriptionStream = @import("schema.zig").SubscriptionStream;
 pub const Introspection = @import("introspection.zig").Introspection;
 pub const GraphQLServer = @import("server.zig").GraphQLServer;
 pub const ServerOptions = @import("server.zig").ServerOptions;

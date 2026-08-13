@@ -71,7 +71,7 @@ pub fn main() !void {
     }
 
     // Load the same key again - it hits the cache, no DB call.
-    const cached = dl.load("1");
+    const cached = try dl.load("1");
     defer if (cached) |c| {
         var owned = c;
         owned.deinit();

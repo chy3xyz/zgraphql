@@ -238,7 +238,7 @@ test "doc generator basic" {
     const name_field = schema.Field.init(allocator, "name", schema.TypeRef.named("String"));
     try user_type.kind.object.fields.put(try allocator.dupe(u8, "name"), name_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("User", user_type);
     try schema_def.registerType("Query", query_type);

@@ -263,7 +263,7 @@ pub const Executor = struct {
         errdefer result.deinit();
 
         const data = try self.executeSelectionSet(&op.selection_set, root_type, Value.fromNull(self.allocator));
-        try result.data.object.put(try self.allocator.dupe(u8, "data"), data);
+        try self.putResultField(&result, "data", data);
 
         // Attach errors if any were collected during execution
         if (self.errors.items.len > 0) {
@@ -285,8 +285,12 @@ pub const Executor = struct {
                     errdefer loc_list.deinit();
                     var loc = Value.initObject(self.allocator);
                     errdefer loc.deinit();
-                    try loc.data.object.put(try self.allocator.dupe(u8, "line"), Value.fromInt(self.allocator, @intCast(err.line.?)));
-                    try loc.data.object.put(try self.allocator.dupe(u8, "column"), Value.fromInt(self.allocator, @intCast(err.col.?)));
+                    // line/col are usize from the AST; cast defensively (they are
+                    // always small in practice, but never overflow silently).
+                    const line_i64 = std.math.cast(i64, err.line.?) orelse 0;
+                    const col_i64 = std.math.cast(i64, err.col.?) orelse 0;
+                    try loc.data.object.put(try self.allocator.dupe(u8, "line"), Value.fromInt(self.allocator, line_i64));
+                    try loc.data.object.put(try self.allocator.dupe(u8, "column"), Value.fromInt(self.allocator, col_i64));
                     try loc_list.data.list.append(loc);
                     try err_obj.data.object.put(try self.allocator.dupe(u8, "locations"), loc_list);
                 }
@@ -528,7 +532,7 @@ pub const Executor = struct {
         if (field_ptrs.items.len <= 1) {
             for (field_ptrs.items, 0..) |field, i| {
                 const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
-                try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
+                try self.putResultField(&result, keys.items[i], field_value);
             }
             return result;
         }
@@ -550,7 +554,7 @@ pub const Executor = struct {
             // Fallback: sequential execution for all fields
             for (field_ptrs.items, 0..) |field, i| {
                 const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
-                try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
+                try self.putResultField(&result, keys.items[i], field_value);
             }
             return result;
         };
@@ -592,7 +596,7 @@ pub const Executor = struct {
                         break :blk Value.fromNull(self.allocator);
                     },
                 };
-                try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
+                try self.putResultField(&result, keys.items[i], field_value);
             }
             return result;
         }
@@ -606,7 +610,7 @@ pub const Executor = struct {
 
         for (field_ptrs.items, 0..) |field, i| {
             const field_value = try self.executeOneFieldSequential(field, parent_type, parent_value, path_prefix, keys.items[i]);
-            try result.data.object.put(try self.allocator.dupe(u8, keys.items[i]), field_value);
+            try self.putResultField(&result, keys.items[i], field_value);
         }
 
         return result;
@@ -628,6 +632,17 @@ pub const Executor = struct {
                 break :blk Value.fromNull(self.allocator);
             },
         };
+    }
+
+    /// Insert a resolved field value into `result`, duplicating the response
+    /// key. On OOM (key allocation or map insertion) the field value is
+    /// released so no memory leaks from partially built results.
+    fn putResultField(self: *Executor, result: *Value, key: []const u8, field_value: Value) std.mem.Allocator.Error!void {
+        var value = field_value;
+        errdefer value.deinit();
+        const key_copy = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(key_copy);
+        try result.data.object.put(key_copy, value);
     }
 
     fn executeSubSelection(self: *Executor, ss: *ast.SelectionSet, field_def: schema.Field, parent_value: Value, path: []const []const u8) ExecutionError!Value {
@@ -1060,7 +1075,7 @@ test "executor basic" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1113,7 +1128,7 @@ test "executor with fragment spread" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "user"), user_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
@@ -1167,7 +1182,7 @@ test "executor field error returns partial data" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "fail"), fail_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1220,7 +1235,7 @@ test "executor operationName selection" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "b"), b_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1281,7 +1296,7 @@ test "executor inline fragment with type condition" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "user"), user_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
@@ -1328,7 +1343,7 @@ test "executor variables substitution" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "greet"), greet_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1381,7 +1396,7 @@ test "executor hooks" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1465,7 +1480,7 @@ test "executor subscription stream" {
     }.subscribe;
     try sub_type.kind.object.fields.put(try allocator.dupe(u8, "counter"), counter_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Subscription", sub_type);
@@ -1548,7 +1563,7 @@ test "executor subscription cancel" {
     }.subscribe;
     try sub_type.kind.object.fields.put(try allocator.dupe(u8, "counter"), counter_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Subscription", sub_type);
@@ -1600,7 +1615,7 @@ test "executor @skip directive" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1676,7 +1691,7 @@ test "executor @skip directive direct selection set" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1732,7 +1747,7 @@ test "executor @include directive" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1805,7 +1820,7 @@ test "executor __typename from schema type" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1847,7 +1862,7 @@ test "executor __typename from runtime value" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "node"), node_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Node", node_type);
@@ -1898,7 +1913,7 @@ test "executor mutation end-to-end" {
     }.resolve;
     try mutation_type.kind.object.fields.put(try allocator.dupe(u8, "increment"), increment_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Mutation", mutation_type);
@@ -1939,7 +1954,7 @@ test "validator rejects mutation on schema without mutation root" {
     };
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "ping"), schema.Field.init(allocator, "ping", schema.TypeRef.named("String")));
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1972,7 +1987,7 @@ test "executor default variables do not leak across executions" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "greeting"), greeting_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -2076,7 +2091,7 @@ test "executor subscription receives user_data as ctx" {
     }.subscribe;
     try sub_type.kind.object.fields.put(try allocator.dupe(u8, "counter"), counter_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("Subscription", sub_type);
@@ -2102,4 +2117,55 @@ test "executor subscription receives user_data as ctx" {
     var event = event_val;
     defer event.deinit();
     try std.testing.expect(user_data.seen_ctx);
+}
+
+test "executor OOM: every allocation failure is handled" {
+    const allocator = std.testing.allocator;
+    const run = struct {
+        fn impl(a: std.mem.Allocator) !void {
+            const query_type = try a.create(schema.Type);
+            query_type.* = .{
+                .name = "Query",
+                .kind = .{ .object = schema.ObjectType.init(a) },
+            };
+            var query_type_owned = true;
+            errdefer if (query_type_owned) {
+                query_type.deinit(a);
+                a.destroy(query_type);
+            };
+            var hello_field = schema.Field.init(a, "hello", schema.TypeRef.named("String"));
+            hello_field.resolve = struct {
+                fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!Value {
+                    return Value.fromString(alloc, try alloc.dupe(u8, "world"));
+                }
+            }.resolve;
+            const hello_key = try a.dupe(u8, "hello");
+            var key_owned = true;
+            errdefer if (key_owned) a.free(hello_key);
+            try query_type.kind.object.fields.put(hello_key, hello_field);
+            key_owned = false; // ownership transferred to the map
+
+            var schema_def = try schema.Schema.init(a, query_type);
+            defer schema_def.deinit();
+            try schema_def.registerType("Query", query_type);
+            query_type_owned = false; // now owned by schema_def
+
+            const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+            var backend = IoBackend.init(a, .{});
+            defer backend.deinit();
+            const io = backend.io();
+
+            var executor = Executor.init(a, &schema_def, io);
+            defer executor.deinit();
+
+            var parser = try @import("parser.zig").Parser.init(a, "{ hello }");
+            defer parser.deinit();
+            var doc = try parser.parseDocument();
+            defer doc.deinit();
+
+            var result = try executor.execute(&doc);
+            result.deinit();
+        }
+    }.impl;
+    try std.testing.checkAllAllocationFailures(allocator, run, .{});
 }

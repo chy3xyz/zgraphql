@@ -74,7 +74,7 @@ test "Server batch execute with mixed valid and invalid queries" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 

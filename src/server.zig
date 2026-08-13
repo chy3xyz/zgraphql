@@ -1,7 +1,34 @@
 const std = @import("std");
-const zg = @import("zgraphql.zig");
+// Import internal modules directly (rather than via zgraphql.zig) to avoid a
+// cyclic import: zgraphql.zig re-exports server.zig, so server.zig must not
+// import zgraphql.zig back. This keeps embedded users who don't need the HTTP
+// server out of the module graph.
+const zg = struct {
+    pub const schema = @import("schema.zig");
+    pub const Value = @import("value.zig").Value;
+    pub const Parser = @import("parser.zig").Parser;
+    pub const Validator = @import("validator.zig").Validator;
+    pub const Executor = @import("executor.zig").Executor;
+    pub const ExecutionHooks = @import("executor.zig").ExecutionHooks;
+    pub const QueryCache = @import("query_cache.zig").QueryCache;
+    pub const MetricsCollector = @import("metrics.zig").MetricsCollector;
+    pub const RateLimiter = @import("rate_limiter.zig").RateLimiter;
+    pub const ResponseCache = @import("response_cache.zig").ResponseCache;
+    pub const DistributedCache = @import("distributed_cache.zig").DistributedCache;
+    pub const AuditLog = @import("audit_log.zig").AuditLog;
+    pub const Tenant = @import("tenant.zig").Tenant;
+    pub const TenantManager = @import("tenant.zig").TenantManager;
+    pub const Tracer = @import("tracing.zig").Tracer;
+    pub const TraceSpan = @import("tracing.zig").TraceSpan;
+    pub const TraceContext = @import("tracing.zig").TraceContext;
+    pub const parseTraceparent = @import("tracing.zig").parseTraceparent;
+    pub const formatTraceparent = @import("tracing.zig").formatTraceparent;
+    pub const randomTraceId = @import("tracing.zig").randomTraceId;
+    pub const randomSpanId = @import("tracing.zig").randomSpanId;
+};
 const Schema = zg.schema.Schema;
 const Value = zg.Value;
+const playground = @import("server_playground.zig");
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
@@ -687,10 +714,19 @@ fn queryIsQuery(query: []const u8) bool {
     const rest = query[i..];
     if (rest.len == 0) return false;
     if (rest[0] == '{') return true; // anonymous operation → query
-    if (std.mem.startsWith(u8, rest, "query")) return true;
-    if (std.mem.startsWith(u8, rest, "mutation")) return false;
-    if (std.mem.startsWith(u8, rest, "subscription")) return false;
+    if (std.mem.startsWith(u8, rest, "query")) return isKeyword(rest, "query");
+    if (std.mem.startsWith(u8, rest, "mutation")) return !isKeyword(rest, "mutation");
+    if (std.mem.startsWith(u8, rest, "subscription")) return !isKeyword(rest, "subscription");
     return false; // fragment-only or unknown document shape
+}
+
+/// Returns true if `kw` appears as a whole GraphQL operation keyword at the
+/// start of `s` (i.e. followed by whitespace, `{`, or end of input), rather
+/// than merely being a prefix of a longer identifier like `queryFoo`.
+fn isKeyword(s: []const u8, kw: []const u8) bool {
+    if (s.len == kw.len) return true;
+    const next = s[kw.len];
+    return next == ' ' or next == '\t' or next == '\r' or next == '\n' or next == '{';
 }
 
 /// Execute a GraphQL query string and return the JSON response.
@@ -730,14 +766,22 @@ fn executeGraphQLAndGetJson(
     }
 
     // Response cache check (only for cacheable queries: no runtime variables,
-    // and the operation is a query — never a mutation or subscription)
+    // and the operation is a query — never a mutation or subscription).
+    // The cache key is tenant-scoped so different tenants never read each
+    // other's cached responses when sharing a global cache.
+    const cache_key: []const u8 = blk: {
+        if (tenant) |t| break :blk try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ t.id, query });
+        break :blk query;
+    };
+    defer if (tenant != null) self.allocator.free(cache_key);
+
     const cacheable = variables.count() == 0 and queryIsQuery(query);
     if (cacheable) {
         // Check distributed cache (L2) first
         if (self.options.distributed_cache) |dc| {
             const now_ts = Io.Clock.Timestamp.now(io, .real);
             const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
-            if (try dc.get(query, now_ms)) |cached| {
+            if (try dc.get(cache_key, now_ms)) |cached| {
                 return .{ .json_str = cached, .complexity = 0, .had_error = false };
             }
         }
@@ -746,7 +790,7 @@ fn executeGraphQLAndGetJson(
             const now_ts = Io.Clock.Timestamp.now(io, .real);
             const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
             // cache.get returns an owned copy; transfer ownership to the caller.
-            if (cache.get(query, now_ms)) |cached| {
+            if (cache.get(cache_key, now_ms)) |cached| {
                 return .{ .json_str = cached, .complexity = 0, .had_error = false };
             }
         }
@@ -890,13 +934,13 @@ fn executeGraphQLAndGetJson(
         const now_ms: i64 = @intCast(@divFloor(now_ts.raw.nanoseconds, std.time.ns_per_ms));
         // Store to distributed cache (L2)
         if (self.options.distributed_cache) |dc| {
-            dc.setWithDefaultTtl(query, json_str, now_ms) catch |err| {
+            dc.setWithDefaultTtl(cache_key, json_str, now_ms) catch |err| {
                 log.warn("failed to store to distributed cache: {s}", .{@errorName(err)});
             };
         }
         // Store to local response cache (L1)
         if (self.options.response_cache) |cache| {
-            cache.put(query, json_str, now_ms) catch |err| {
+            cache.put(cache_key, json_str, now_ms) catch |err| {
                 log.warn("failed to cache response: {s}", .{@errorName(err)});
             };
         }
@@ -1042,7 +1086,7 @@ fn sendPlayground(request: *http.Server.Request, origin: []const u8) !void {
         .{ .name = "access-control-allow-origin", .value = if (origin.len > 0) origin else "*" },
         .{ .name = "vary", .value = "origin" },
     };
-    try request.respond(simple_playground_html, .{
+    try request.respond(playground.simple_playground_html, .{
         .status = .ok,
         .extra_headers = &headers,
     });
@@ -1712,7 +1756,7 @@ test "server executeGraphQLAndGetJson basic" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1757,7 +1801,7 @@ test "server depth limit" {
     const name_field = zg.schema.Field.init(allocator, "name", zg.schema.TypeRef.named("String"));
     try user_type.kind.object.fields.put(try allocator.dupe(u8, "name"), name_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
@@ -1801,7 +1845,7 @@ test "server complexity limit" {
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "b"), b_field);
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "c"), c_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1845,7 +1889,7 @@ test "server query whitelist" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1900,7 +1944,7 @@ test "server batch execute multiple queries" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1943,7 +1987,7 @@ test "server batch with missing query" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -1984,7 +2028,7 @@ test "server batch with depth limit error" {
     const name_field = zg.schema.Field.init(allocator, "name", zg.schema.TypeRef.named("String"));
     try user_type.kind.object.fields.put(try allocator.dupe(u8, "name"), name_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
     try schema_def.registerType("User", user_type);
@@ -2025,7 +2069,7 @@ test "server batch APQ" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -2110,7 +2154,7 @@ test "server batch APQ with HMAC signature" {
     }.resolve;
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = zg.schema.Schema.init(allocator, query_type);
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
@@ -2210,107 +2254,61 @@ test "server batch APQ with HMAC signature" {
 }
 
 
-// ------------------------------------------------------------------
-// Playground HTML
-// ------------------------------------------------------------------
 
-/// Zero-dependency minimal GraphQL playground. Works offline.
-const simple_playground_html =
-    \\<!DOCTYPE html>
-    \\<html lang="en">
-    \\<head>
-    \\  <meta charset="UTF-8">
-    \\  <title>zgraphql Playground</title>
-    \\  <style>
-    \\    * { box-sizing: border-box; margin: 0; padding: 0; }
-    \\    body { display: flex; height: 100vh; background: #1e1e1e; color: #d4d4d4; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-    \\    .pane { flex: 1; display: flex; flex-direction: column; border-right: 1px solid #333; }
-    \\    .pane:last-child { border-right: none; }
-    \\    h2 { padding: 8px 12px; background: #252526; font-size: 13px; font-weight: 600; border-bottom: 1px solid #333; }
-    \\    textarea, pre { flex: 1; padding: 12px; background: #1e1e1e; color: #d4d4d4; border: none; resize: none; outline: none; font-size: 13px; line-height: 1.5; }
-    \\    pre { overflow: auto; white-space: pre-wrap; word-break: break-word; }
-    \\    button { margin: 8px 12px; padding: 6px 16px; background: #0e639c; color: #fff; border: none; cursor: pointer; font-size: 13px; border-radius: 3px; }
-    \\    button:hover { background: #1177bb; }
-    \\    .toolbar { display: flex; gap: 8px; padding: 8px 12px; background: #252526; border-bottom: 1px solid #333; }
-    \\    .error { color: #f48771; }
-    \\    .success { color: #b5cea8; }
-    \\    .status { padding: 4px 12px; font-size: 12px; background: #252526; border-top: 1px solid #333; }
-    \\  </style>
-    \\</head>
-    \\<body>
-    \\  <div class="pane">
-    \\    <h2>Query</h2>
-    \\    <textarea id="query" spellcheck="false" placeholder="Enter GraphQL query...">{ hello }</textarea>
-    \\    <h2>Variables (JSON)</h2>
-    \\    <textarea id="vars" spellcheck="false" placeholder="{}">{}</textarea>
-    \\    <div class="toolbar">
-    \\      <button onclick="send()">Execute</button>
-    \\      <button onclick="introspect()">Introspect</button>
-    \\      <button onclick="prettify()">Prettify</button>
-    \\    </div>
-    \\    <div class="status" id="status">Ready</div>
-    \\  </div>
-    \\  <div class="pane">
-    \\    <h2>Response</h2>
-    \\    <pre id="response"></pre>
-    \\  </div>
-    \\  <script>
-    \\    async function send() {
-    \\      const q = document.getElementById('query').value;
-    \\      const v = document.getElementById('vars').value;
-    \\      const statusEl = document.getElementById('status');
-    \\      const respEl = document.getElementById('response');
-    \\      statusEl.textContent = 'Loading...';
-    \\      try {
-    \\        const res = await fetch('/graphql', {
-    \\          method: 'POST',
-    \\          headers: { 'Content-Type': 'application/json' },
-    \\          body: JSON.stringify({ query: q, variables: JSON.parse(v || '{}') })
-    \\        });
-    \\        const data = await res.json();
-    \\        respEl.textContent = JSON.stringify(data, null, 2);
-    \\        statusEl.textContent = res.ok ? 'OK ' + res.status : 'Error ' + res.status;
-    \\        statusEl.className = res.ok ? 'status success' : 'status error';
-    \\      } catch (e) {
-    \\        respEl.textContent = String(e);
-    \\        statusEl.textContent = 'Network Error';
-    \\        statusEl.className = 'status error';
-    \\      }
-    \\    }
-    \\    function introspect() {
-    \\      document.getElementById('query').value = '{ __schema { queryType { name } mutationType { name } subscriptionType { name } types { name kind fields { name type { name kind } } } } }';
-    \\      send();
-    \\    }
-    \\    function prettify() {
-    \\      const q = document.getElementById('query').value;
-    \\      document.getElementById('query').value = JSON.stringify({q:q}).slice(5,-1).replace(/\\n/g,'\n').replace(/\\t/g,'  ');
-    \\    }
-    \\  </script>
-    \\</body>
-    \\</html>
-;
+test "server response cache is tenant-isolated" {
+    const allocator = std.testing.allocator;
 
-/// GraphiQL playground via CDN. Requires internet access.
-const graphiql_html =
-    \\<!DOCTYPE html>
-    \\<html lang="en">
-    \\<head>
-    \\  <meta charset="UTF-8">
-    \\  <title>GraphiQL</title>
-    \\  <link rel="stylesheet" crossorigin href="https://unpkg.com/graphiql@3/graphiql.min.css" />
-    \\  <style>body{margin:0;height:100vh;}#root{height:100vh;}</style>
-    \\</head>
-    \\<body>
-    \\  <div id="root"></div>
-    \\  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    \\  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    \\  <script crossorigin src="https://unpkg.com/graphiql@3/graphiql.min.js"></script>
-    \\  <script>
-    \\    const fetcher = GraphiQL.createFetcher({ url: '/graphql' });
-    \\    ReactDOM.createRoot(document.getElementById('root')).render(
-    \\      React.createElement(GraphiQL, { fetcher: fetcher, defaultEditorToolsVisibility: true })
-    \\    );
-    \\  </script>
-    \\</body>
-    \\</html>
-;
+    const query_type = try allocator.create(zg.schema.Type);
+    query_type.* = .{
+        .name = "Query",
+        .kind = .{ .object = zg.schema.ObjectType.init(allocator) },
+    };
+    var hello_field = zg.schema.Field.init(allocator, "hello", zg.schema.TypeRef.named("String"));
+    hello_field.resolve = struct {
+        fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: Value, _: std.StringHashMap(Value)) anyerror!Value {
+            return Value.fromString(alloc, try alloc.dupe(u8, "world"));
+        }
+    }.resolve;
+    try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
+
+    var schema_def = try zg.schema.Schema.init(allocator, query_type);
+    defer schema_def.deinit();
+    try schema_def.registerType("Query", query_type);
+
+    var rc = zg.ResponseCache.init(allocator, 60_000);
+    defer rc.deinit();
+
+    var server = GraphQLServer.init(allocator, &schema_def, .{
+        .response_cache = &rc,
+    });
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+
+    var variables = std.StringHashMap(Value).init(allocator);
+    defer {
+        var viter = variables.iterator();
+        while (viter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        variables.deinit();
+    }
+
+    var tenant_a = zg.Tenant{ .id = "tenant-a" };
+    var tenant_b = zg.Tenant{ .id = "tenant-b" };
+
+    // First request for tenant-a caches its response.
+    const r1 = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables, &tenant_a);
+    defer allocator.free(r1.json_str);
+    try std.testing.expect(!r1.had_error);
+
+    // A different tenant with the same query must NOT hit tenant-a's cache
+    // entry; the resolver runs again (still returns "world", but the point is
+    // the cache key is tenant-scoped and no cross-tenant data is served).
+    const r2 = try executeGraphQLAndGetJson(&server, backend.io(), "{ hello }", null, &variables, &tenant_b);
+    defer allocator.free(r2.json_str);
+    try std.testing.expect(!r2.had_error);
+    try std.testing.expect(std.mem.indexOf(u8, r2.json_str, "world") != null);
+}

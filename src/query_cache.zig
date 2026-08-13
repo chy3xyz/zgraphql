@@ -221,3 +221,48 @@ test "query cache remove frees entry" {
     try std.testing.expect(!cache.contains("{ hello }"));
     try std.testing.expect(cache.get(hash) == null);
 }
+
+test "query cache concurrent store and get" {
+    const allocator = std.testing.allocator;
+
+    var cache = QueryCache.init(allocator);
+    defer cache.deinit();
+
+    // Pre-populate a set of queries.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const q = try std.fmt.bufPrint(&buf, "{{ hello {d} }}", .{i});
+        try cache.store(q);
+    }
+
+    // Concurrently read and write from multiple threads. The spin lock must
+    // keep the underlying hash map consistent (no data race).
+    const threads = 4;
+    const iters_per_thread = 200;
+    var errors: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+    const worker = struct {
+        fn run(c: *QueryCache, a: std.mem.Allocator, errs: *std.atomic.Value(u32)) void {
+            var k: usize = 0;
+            while (k < iters_per_thread) : (k += 1) {
+                var buf: [64]u8 = undefined;
+                const q = std.fmt.bufPrint(&buf, "{{ hello {d} }}", .{k % 20}) catch continue;
+                if (c.get(q)) |owned| {
+                    a.free(owned);
+                }
+                if (!c.contains(q)) {
+                    _ = errs.fetchAdd(1, .seq_cst);
+                }
+            }
+        }
+    }.run;
+
+    var handles: [threads]std.Thread = undefined;
+    for (&handles) |*h| {
+        h.* = try std.Thread.spawn(.{}, worker, .{ &cache, allocator, &errors });
+    }
+    for (&handles) |*h| h.join();
+
+    try std.testing.expectEqual(@as(u32, 0), errors.load(.seq_cst));
+}

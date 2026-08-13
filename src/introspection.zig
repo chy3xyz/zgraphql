@@ -306,7 +306,7 @@ test "introspection basic" {
     const hello_field = schema.Field.init(allocator, "hello", schema.TypeRef.named("String"));
     try query_type.kind.object.fields.put(try allocator.dupe(u8, "hello"), hello_field);
 
-    var schema_def = schema.Schema.init(allocator, query_type);
+    var schema_def = try schema.Schema.init(allocator, query_type);
     defer schema_def.deinit();
     try schema_def.registerType("Query", query_type);
 
