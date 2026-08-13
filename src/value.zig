@@ -102,7 +102,9 @@ pub const Value = struct {
                 var new = initList(allocator);
                 errdefer new.deinit(allocator);
                 for (list.items) |item| {
-                    try new.data.list.append(try item.clone(allocator));
+                    var cloned = try item.clone(allocator);
+                    errdefer cloned.deinit(allocator);
+                    try new.data.list.append(cloned);
                 }
                 return new;
             },
@@ -113,7 +115,9 @@ pub const Value = struct {
                 while (iter.next()) |entry| {
                     const key = try allocator.dupe(u8, entry.key_ptr.*);
                     errdefer allocator.free(key);
-                    try new.data.object.put(key, try entry.value_ptr.clone(allocator));
+                    var cloned = try entry.value_ptr.clone(allocator);
+                    errdefer cloned.deinit(allocator);
+                    try new.data.object.put(key, cloned);
                 }
                 return new;
             },

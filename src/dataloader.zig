@@ -150,7 +150,7 @@ pub const DataLoader = struct {
     ///
     /// Returns error.NoBatchFunction if no batch function is configured.
     /// Returns error.BatchLoadFailed if the key could not be resolved.
-    pub fn loadBatched(self: *DataLoader, key: []const u8) !(error{ NoBatchFunction, BatchLoadFailed, Canceled } || std.mem.Allocator.Error)!Value {
+    pub fn loadBatched(self: *DataLoader, key: []const u8) anyerror!Value {
         // Fast path: already cached
         if (try self.load(key)) |v| return v;
 
@@ -175,7 +175,7 @@ pub const DataLoader = struct {
             defer self.mutex.unlock(self.io);
 
             if (self.pending.count() > 0) {
-                var keys_list = std.ArrayList([]const u8).init(self.allocator);
+                var keys_list = std.array_list.Managed([]const u8).init(self.allocator);
                 defer {
                     for (keys_list.items) |k| self.allocator.free(k);
                     keys_list.deinit();
@@ -197,8 +197,8 @@ pub const DataLoader = struct {
                 for (keys_list.items, values) |k, v| {
                     const owned_key = try self.allocator.dupe(u8, k);
                     errdefer self.allocator.free(owned_key);
-                    const owned_value = try v.clone();
-                    errdefer owned_value.deinit();
+                    var owned_value = try v.clone(self.allocator);
+                    errdefer owned_value.deinit(self.allocator);
                     try self.cache.put(owned_key, owned_value);
                 }
 
@@ -296,4 +296,24 @@ test "dataloader loadMany" {
     }
 
     try std.testing.expectEqual(@as(usize, 1), call_count);
+}
+
+test "dataloader loadBatched fast path" {
+    const allocator = std.testing.allocator;
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(allocator, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    var dl = DataLoader.init(allocator, io);
+    defer dl.deinit();
+
+    // Prime cache first so loadBatched takes the fast path (no batch needed).
+    var val = Value.fromString(allocator, try allocator.dupe(u8, "hello"));
+    defer val.deinit(allocator);
+    try dl.prime("key1", val);
+
+    var loaded = try dl.loadBatched("key1");
+    defer loaded.deinit(allocator);
+    try std.testing.expectEqualStrings("hello", loaded.data.string);
 }

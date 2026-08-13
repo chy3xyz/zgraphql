@@ -92,7 +92,7 @@ pub const QueryPlanCache = struct {
         lockMutex(&self.mutex);
         defer self.mutex.unlock();
 
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        var to_remove = std.array_list.Managed([]const u8).init(self.allocator);
         defer {
             for (to_remove.items) |k| self.allocator.free(k);
             to_remove.deinit();
@@ -101,7 +101,11 @@ pub const QueryPlanCache = struct {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.expires_at_ms < now_ms) {
-                to_remove.append(try self.allocator.dupe(u8, entry.key_ptr.*)) catch continue;
+                const key = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                to_remove.append(key) catch {
+                    self.allocator.free(key);
+                    continue;
+                };
             }
         }
 

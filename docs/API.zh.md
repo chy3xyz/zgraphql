@@ -35,9 +35,9 @@ Value.initObject(allocator)
 
 **生命周期**
 ```zig
-value.deinit()      // 深度释放
-value.clone()       // 深度拷贝
-value.toJson()      // 序列化为 JSON 字符串
+value.deinit(allocator)      // 深度释放
+value.clone(allocator)       // 深度拷贝
+value.toJson(allocator)      // 序列化为 JSON 字符串
 ```
 
 ---

@@ -135,10 +135,8 @@ pub const DistributedCache = struct {
 
     /// Convenience: store a GraphQL Value directly (serializes to JSON).
     pub fn setValue(self: *DistributedCache, raw_key: []const u8, value: Value, ttl_ms: u32, now_ms: i64) !void {
-        // Use the value's allocator to free, since toJson allocates with it
-        const val_allocator = value.allocator;
-        const json_str = try value.toJson();
-        defer val_allocator.free(json_str);
+        const json_str = try value.toJson(self.allocator);
+        defer self.allocator.free(json_str);
         try self.set(raw_key, json_str, ttl_ms, now_ms);
     }
 };
@@ -434,4 +432,29 @@ test "DistributedCache setWithDefaultTtl" {
     defer if (hit) |h| std.testing.allocator.free(h);
     try std.testing.expect(hit != null);
     try std.testing.expectEqualStrings("value", hit.?);
+}
+
+test "DistributedCache setValue serializes a GraphQL Value" {
+    var backend = SimpleMemoryBackend.init(std.testing.allocator);
+    defer backend.deinit();
+
+    var dc = DistributedCache.init(
+        std.testing.allocator,
+        backend.cacheBackend(),
+        "test:",
+        null,
+    );
+    defer dc.deinit();
+
+    var value = @import("value.zig").Value.initObject(std.testing.allocator);
+    defer value.deinit(std.testing.allocator);
+    try value.data.object.put(try std.testing.allocator.dupe(u8, "hello"), @import("value.zig").Value.fromString(std.testing.allocator, try std.testing.allocator.dupe(u8, "world")));
+
+    const now: i64 = nowMs();
+    try dc.setValue("query-v", value, 10000, now);
+
+    const hit = try dc.get("query-v", now);
+    defer if (hit) |h| std.testing.allocator.free(h);
+    try std.testing.expect(hit != null);
+    try std.testing.expect(std.mem.indexOf(u8, hit.?, "world") != null);
 }

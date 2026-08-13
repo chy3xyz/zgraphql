@@ -35,9 +35,9 @@ Value.initObject(allocator)
 
 **Lifecycle**
 ```zig
-value.deinit()      // Deep free
-value.clone()       // Deep copy
-value.toJson()      // Serialize to JSON string
+value.deinit(allocator)      // Deep free
+value.clone(allocator)       // Deep copy
+value.toJson(allocator)      // Serialize to JSON string
 ```
 
 ---

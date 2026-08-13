@@ -79,7 +79,7 @@ pub const ResponseCache = struct {
         defer self.mutex.unlock();
 
         var iter = self.entries.iterator();
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        var to_remove = std.array_list.Managed([]const u8).init(self.allocator);
         defer {
             for (to_remove.items) |k| self.allocator.free(k);
             to_remove.deinit();
@@ -87,7 +87,11 @@ pub const ResponseCache = struct {
 
         while (iter.next()) |entry| {
             if (entry.value_ptr.expires_at_ms < now_ms) {
-                to_remove.append(try self.allocator.dupe(u8, entry.key_ptr.*)) catch continue;
+                const key = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                to_remove.append(key) catch {
+                    self.allocator.free(key);
+                    continue;
+                };
             }
         }
 
@@ -110,4 +114,24 @@ test "ResponseCache basic" {
     defer allocator.free(hit);
     try std.testing.expectEqualStrings("{\"data\":{}}", hit);
     try std.testing.expect(cache.get("query1", 2000) == null); // expired
+}
+
+test "ResponseCache prune removes expired entries" {
+    const allocator = std.testing.allocator;
+    var cache = ResponseCache.init(allocator, 1000);
+    defer cache.deinit();
+
+    try cache.put("k1", "v1", 100);
+    try cache.put("k2", "v2", 100);
+
+    // At t=500, nothing expired (TTL 1000).
+    cache.prune(500);
+    const alive = cache.get("k1", 500);
+    defer if (alive) |a| allocator.free(a);
+    try std.testing.expect(alive != null);
+
+    // At t=2000, both expired.
+    cache.prune(2000);
+    try std.testing.expect(cache.get("k1", 2000) == null);
+    try std.testing.expect(cache.get("k2", 2000) == null);
 }

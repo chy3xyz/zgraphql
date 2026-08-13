@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **`DataLoader.loadBatched` was broken dead code**: it used the removed `std.ArrayList.init` API and the old `Value.clone()`/`Value.deinit()` signatures, and had a malformed double-`!` return type. It now compiles and passes a fast-path test.
+- **`DistributedCache.setValue` was broken dead code**: it accessed the removed `value.allocator` field and called `value.toJson()` without an allocator. Now uses `self.allocator`.
+- **`ResponseCache.prune` / `QueryPlanCache.prune` were broken dead code**: `std.ArrayList.init` + `try dupe` in a `void` function (would not compile). Now use `std.array_list.Managed` and degrade gracefully on OOM.
+- **`Value.clone` OOM leak**: a successfully cloned child value leaked when the subsequent list append / map insert failed. Each cloned child is now cleaned up on error.
+- **Docs**: `docs/API.md` / `docs/API.zh.md` Value lifecycle examples updated to the explicit-allocator signatures.
+
+### Added
+- Tests exercising the previously-dead code paths: `DataLoader.loadBatched` fast path, `DistributedCache.setValue`, `ResponseCache.prune`.
+
 ## [0.6.0] - 2026-08-06
 
 ### Changed
