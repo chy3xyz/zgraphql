@@ -10,11 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **`DataLoader.loadBatched` was broken dead code**: it used the removed `std.ArrayList.init` API and the old `Value.clone()`/`Value.deinit()` signatures, and had a malformed double-`!` return type. It now compiles and passes a fast-path test.
 - **`DistributedCache.setValue` was broken dead code**: it accessed the removed `value.allocator` field and called `value.toJson()` without an allocator. Now uses `self.allocator`.
-- **`ResponseCache.prune` / `QueryPlanCache.prune` were broken dead code**: `std.ArrayList.init` + `try dupe` in a `void` function (would not compile). Now use `std.array_list.Managed` and degrade gracefully on OOM.
+- **`ResponseCache.prune` / `QueryPlanCache.prune` / `RateLimiter.prune` were broken dead code**: `std.ArrayList.init` + `try dupe` in a `void` function (would not compile). Now use `std.array_list.Managed` and degrade gracefully on OOM.
+- **`HttpCacheBackend` was broken dead code**: it used the pre-0.17 `std.http.Client.open` API (which no longer exists) and constructed `Client` without the required `io` field. Migrated to `client.fetch`; `init` now takes an `io` argument (breaking).
+- **`TenantManager.tenantHooks` removed**: this uncalled helper attempted to capture the outer `base` parameter in a nested function (Zig has no closures), so it could never compile. It was never exported or used.
 - **`Value.clone` OOM leak**: a successfully cloned child value leaked when the subsequent list append / map insert failed. Each cloned child is now cleaned up on error.
-- **Docs**: `docs/API.md` / `docs/API.zh.md` Value lifecycle examples updated to the explicit-allocator signatures.
+- **Docs**: `docs/API.md` / `docs/API.zh.md` Value lifecycle examples updated to the explicit-allocator signatures; `HttpCacheBackend.init` docs updated with the new `io` argument.
 
 ### Added
+- **`zig build compile-all`**: a compile-time probe (`src/compile_all.zig`) that takes the address of every public function, forcing its body to be type-checked. This catches dead-code regressions (uncalled pub fns with compile errors) that Zig's lazy compilation would otherwise miss. Wired into `zig build test` and CI.
 - Tests exercising the previously-dead code paths: `DataLoader.loadBatched` fast path, `DistributedCache.setValue`, `ResponseCache.prune`.
 
 ## [0.6.0] - 2026-08-06

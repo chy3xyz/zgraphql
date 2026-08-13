@@ -156,10 +156,10 @@ pub const HttpCacheBackend = struct {
     client: std.http.Client,
     base_url: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, base_url: []const u8) !HttpCacheBackend {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, base_url: []const u8) !HttpCacheBackend {
         return .{
             .allocator = allocator,
-            .client = std.http.Client{ .allocator = allocator },
+            .client = std.http.Client{ .allocator = allocator, .io = io },
             .base_url = try allocator.dupe(u8, base_url),
         };
     }
@@ -183,20 +183,17 @@ pub const HttpCacheBackend = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_url, key });
         defer allocator.free(url);
 
-        const uri = try std.Uri.parse(url);
-        var server_header_buffer: [16 * 1024]u8 = undefined;
-        var req = try self.client.open(.GET, uri, .{
-            .server_header_buffer = &server_header_buffer,
-            .keep_alive = true,
-        });
-        defer req.deinit();
-        try req.send();
-        try req.finish();
-        try req.wait();
+        var body = std.Io.Writer.Allocating.init(allocator);
+        defer body.deinit();
 
-        if (req.response.status != .ok) return null;
-        const body = try req.reader().readAllAlloc(allocator, 10 * 1024 * 1024);
-        return body;
+        const result = self.client.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .response_writer = &body.writer,
+        }) catch return null;
+
+        if (result.status != .ok) return null;
+        return try body.toOwnedSlice();
     }
 
     fn setImpl(ctx: ?*anyopaque, allocator: std.mem.Allocator, key: []const u8, value: []const u8, ttl_ms: u32) !void {
@@ -204,18 +201,11 @@ pub const HttpCacheBackend = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}?ttl={d}", .{ self.base_url, key, ttl_ms });
         defer allocator.free(url);
 
-        const uri = try std.Uri.parse(url);
-        var server_header_buffer: [16 * 1024]u8 = undefined;
-        var req = try self.client.open(.PUT, uri, .{
-            .server_header_buffer = &server_header_buffer,
-            .keep_alive = true,
+        _ = try self.client.fetch(.{
+            .location = .{ .url = url },
+            .method = .PUT,
+            .payload = value,
         });
-        defer req.deinit();
-        req.transfer_encoding = .{ .content_length = value.len };
-        try req.send();
-        try req.writeAll(value);
-        try req.finish();
-        try req.wait();
     }
 
     fn deleteImpl(ctx: ?*anyopaque, allocator: std.mem.Allocator, key: []const u8) !void {
@@ -223,16 +213,10 @@ pub const HttpCacheBackend = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.base_url, key });
         defer allocator.free(url);
 
-        const uri = try std.Uri.parse(url);
-        var server_header_buffer: [16 * 1024]u8 = undefined;
-        var req = try self.client.open(.DELETE, uri, .{
-            .server_header_buffer = &server_header_buffer,
-            .keep_alive = true,
+        _ = try self.client.fetch(.{
+            .location = .{ .url = url },
+            .method = .DELETE,
         });
-        defer req.deinit();
-        try req.send();
-        try req.finish();
-        try req.wait();
     }
 };
 

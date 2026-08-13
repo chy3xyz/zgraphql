@@ -156,7 +156,7 @@ zgraphql provides built-in tenant isolation via `TenantManager` (see Section 8 b
 For multi-node deployments, use `DistributedCache` with an HTTP cache backend:
 
 ```zig
-var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache-proxy:8080");
+var http_backend = try zg.HttpCacheBackend.init(allocator, io, "http://cache-proxy:8080");
 defer http_backend.deinit();
 
 var dc = zg.DistributedCache.init(

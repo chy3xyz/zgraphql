@@ -173,24 +173,6 @@ pub const TenantContext = struct {
     tenant_manager: *TenantManager,
 };
 
-/// Helper to build an ExecutionHooks wrapper that injects tenant roles
-/// into the hasRole check.
-pub fn tenantHooks(base: @import("executor.zig").ExecutionHooks) @import("executor.zig").ExecutionHooks {
-    var hooks = base;
-    hooks.hasRole = struct {
-        fn check(ctx: ?*anyopaque, role: []const u8) bool {
-            const tc = @as(*TenantContext, @ptrCast(@alignCast(ctx.?)));
-            // Check tenant-specific roles first
-            for (tc.tenant.roles) |r| {
-                if (std.mem.eql(u8, r, role)) return true;
-            }
-            // Fall back to base hook if available
-            return if (base.hasRole) |base_hook| base_hook(ctx, role) else false;
-        }
-    }.check;
-    return hooks;
-}
-
 // ------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------

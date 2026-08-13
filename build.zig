@@ -21,6 +21,24 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
 
+    // Compile-all probe: force semantic analysis of every public function so
+    // dead-code regressions (uncalled pub fns with compile errors) are caught.
+    // Compiled as an object (not run) — the comptime block takes each pub
+    // function's address, forcing its body to be type-checked.
+    const compile_all_step = b.step("compile-all", "Force-compile every public API");
+    const compile_all_obj = b.addObject(.{
+        .name = "compile_all",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compile_all.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    compile_all_step.dependOn(&compile_all_obj.step);
+    // Also compile the probe as part of `zig build test` so local test runs
+    // catch dead-code regressions too.
+    test_step.dependOn(&compile_all_obj.step);
+
     // Integration tests
     const integration_test_step = b.step("integration-test", "Run integration tests");
     const integration_tests = b.addTest(.{

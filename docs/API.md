@@ -204,7 +204,7 @@ try dc.delete("{ hello }");
 
 **HttpCacheBackend**
 ```zig
-var http = try zg.HttpCacheBackend.init(allocator, "http://cache:8080");
+var http = try zg.HttpCacheBackend.init(allocator, io, "http://cache:8080");
 defer http.deinit();
 var dc = zg.DistributedCache.init(allocator, http.cacheBackend(), "prefix:", &l1);
 ```

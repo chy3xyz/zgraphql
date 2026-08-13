@@ -401,7 +401,7 @@ var server = zg.GraphQLServer.init(allocator, &schema_def, .{
 For HTTP-based backends (e.g. Varnish, custom cache proxy):
 
 ```zig
-var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache:8080");
+var http_backend = try zg.HttpCacheBackend.init(allocator, io, "http://cache:8080");
 defer http_backend.deinit();
 
 var dc = zg.DistributedCache.init(

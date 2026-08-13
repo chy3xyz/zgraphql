@@ -156,7 +156,7 @@ zgraphql 通过 `TenantManager` 提供内置租户隔离（见下方第 8 节）
 多节点部署时，使用 `DistributedCache` 配合 HTTP 缓存后端：
 
 ```zig
-var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache-proxy:8080");
+var http_backend = try zg.HttpCacheBackend.init(allocator, io, "http://cache-proxy:8080");
 defer http_backend.deinit();
 
 var dc = zg.DistributedCache.init(

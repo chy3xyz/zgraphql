@@ -23,6 +23,9 @@ jobs:
       - name: Build
         run: zig build
 
+      - name: Force-compile all public API (dead-code guard)
+        run: zig build compile-all
+
       - name: Run unit tests
         run: zig build test
 

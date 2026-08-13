@@ -98,7 +98,11 @@ pub const RateLimiter = struct {
         var iter = self.buckets.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.last_update_ms < older_than_ms) {
-                to_remove.append(self.allocator.dupe(u8, entry.key_ptr.*)) catch continue;
+                const key = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                to_remove.append(key) catch {
+                    self.allocator.free(key);
+                    continue;
+                };
             }
         }
 
