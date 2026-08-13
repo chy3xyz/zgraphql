@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Tenant isolation bypass in batch and WebSocket paths**: batched requests and WS single-shot queries passed `tenant=null` to the execution pipeline, so they fell back to global limits/schema instead of the resolved tenant's. Tenant resolution is now done before the WS upgrade and threaded through both paths.
-- **SDL parser gaps**: added directive-definition parsing (`directive @x(...) [repeatable] on ...`), field `@deprecated(reason:)` parsing, and argument default values; also fixed a double-free when registering parsed directives and a dangling `deprecation_reason`.
-- **Introspection metadata**: `description` and `defaultValue` are now populated from the schema instead of always being `null`.
+- **SDL parser gaps**: added directive-definition parsing (`directive @x(...) [repeatable] on ...`), field `@deprecated(reason:)` parsing, argument default values, and leading `description` support for schema/types/fields/enum values/directives (with correct ownership); also fixed a double-free when registering parsed directives and a dangling `deprecation_reason`.
+- **Introspection metadata**: `description` (schema/type/field/input/enum value) and `defaultValue` are now populated from the schema instead of always being `null`; enum values now report `deprecationReason`.
 - **Validator spec gaps**: added UniqueOperationNames, LoneAnonymousOperation, NoUnusedFragments, VariablesAreInputTypes, constant variable defaults, and OverlappingFieldsCanBeMerged.
 - **WS protocol**: handle `connection_terminate`.
 - **`HttpCacheBackend.setImpl`/`deleteImpl` swallowed non-2xx status**: the HTTP status from `client.fetch` was discarded, so a failed cache write (404/500/503) silently reported success. Non-2xx now returns `error.CacheWriteFailed`.

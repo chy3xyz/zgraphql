@@ -64,6 +64,7 @@ pub const SchemaParser = struct {
         var query_type_name: ?[]const u8 = null;
         var mutation_type_name: ?[]const u8 = null;
         var subscription_type_name: ?[]const u8 = null;
+        var schema_description: ?[]const u8 = null;
 
         var directives = std.StringHashMap(schema.DirectiveDefinition).init(self.allocator);
         defer {
@@ -76,28 +77,41 @@ pub const SchemaParser = struct {
         }
 
         while (self.current.kind != .eof) {
+            // Optional leading description (string or block_string) before a
+            // type/directive definition. Ownership transfers to the parsed
+            // definition on success; freed here on error.
+            var description: ?[]const u8 = null;
+            if (self.current.kind == .string or self.current.kind == .block_string) {
+                description = try self.allocator.dupe(u8, self.current.text);
+                try self.advance();
+            }
+            errdefer if (description) |d| self.allocator.free(d);
+
             if (self.current.isKeyword("schema")) {
+                // Transfer the leading description into schema_description.
+                schema_description = description;
+                description = null;
                 try self.parseSchemaDefinition(&query_type_name, &mutation_type_name, &subscription_type_name);
             } else if (self.current.isKeyword("type")) {
-                const typ = try self.parseObjectType();
+                const typ = try self.parseObjectType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("interface")) {
-                const typ = try self.parseInterfaceType();
+                const typ = try self.parseInterfaceType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("enum")) {
-                const typ = try self.parseEnumType();
+                const typ = try self.parseEnumType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("union")) {
-                const typ = try self.parseUnionType();
+                const typ = try self.parseUnionType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("input")) {
-                const typ = try self.parseInputType();
+                const typ = try self.parseInputType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("scalar")) {
-                const typ = try self.parseScalarType();
+                const typ = try self.parseScalarType(description);
                 try types.put(typ.name, typ);
             } else if (self.current.isKeyword("directive")) {
-                try self.parseDirectiveDefinition(&directives);
+                try self.parseDirectiveDefinition(&directives, description);
             } else {
                 return error.UnexpectedToken;
             }
@@ -106,6 +120,7 @@ pub const SchemaParser = struct {
         // Resolve root types
         const qt = types.get(query_type_name orelse return error.MissingQueryType) orelse return error.MissingQueryType;
         var schema_def = try schema.Schema.init(self.allocator, qt);
+        schema_def.description = schema_description;
 
         var iter = types.iterator();
         while (iter.next()) |entry| {
@@ -186,7 +201,7 @@ pub const SchemaParser = struct {
         try self.expect(.rbrace);
     }
 
-    fn parseObjectType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseObjectType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("type");
         const name = try self.expectName();
 
@@ -220,13 +235,14 @@ pub const SchemaParser = struct {
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .object = obj_type },
         };
         typ.kind.object.interfaces = interfaces;
         return typ;
     }
 
-    fn parseInterfaceType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseInterfaceType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("interface");
         const name = try self.expectName();
 
@@ -243,12 +259,13 @@ pub const SchemaParser = struct {
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .interface = iface_type },
         };
         return typ;
     }
 
-    fn parseEnumType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseEnumType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("enum");
         const name = try self.expectName();
 
@@ -257,8 +274,15 @@ pub const SchemaParser = struct {
         errdefer enum_type.deinit(self.allocator);
 
         while (!self.check(.rbrace)) {
+            // Optional leading description per enum value.
+            var val_desc: ?[]const u8 = null;
+            if (self.current.kind == .string or self.current.kind == .block_string) {
+                val_desc = try self.allocator.dupe(u8, self.current.text);
+                try self.advance();
+            }
+            errdefer if (val_desc) |d| self.allocator.free(d);
             const val_name = try self.allocator.dupe(u8, try self.expectName());
-            try enum_type.values.put(val_name, .{ .name = val_name });
+            try enum_type.values.put(val_name, .{ .name = val_name, .description = val_desc });
             if (self.check(.rbrace)) break;
         }
         try self.expect(.rbrace);
@@ -266,12 +290,13 @@ pub const SchemaParser = struct {
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .enum_type = enum_type },
         };
         return typ;
     }
 
-    fn parseUnionType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseUnionType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("union");
         const name = try self.expectName();
 
@@ -292,12 +317,13 @@ pub const SchemaParser = struct {
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .union_type = union_type },
         };
         return typ;
     }
 
-    fn parseInputType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseInputType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("input");
         const name = try self.expectName();
 
@@ -321,18 +347,20 @@ pub const SchemaParser = struct {
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .input_object = input_type },
         };
         return typ;
     }
 
-    fn parseScalarType(self: *SchemaParser) SchemaParseError!*schema.Type {
+    fn parseScalarType(self: *SchemaParser, description: ?[]const u8) SchemaParseError!*schema.Type {
         try self.expectKeyword("scalar");
         const name = try self.expectName();
 
         const typ = try self.allocator.create(schema.Type);
         typ.* = .{
             .name = name,
+            .description = description,
             .kind = .{ .scalar = .{} },
         };
         return typ;
@@ -340,12 +368,13 @@ pub const SchemaParser = struct {
 
     /// Parse a directive definition:
     ///   directive @name(args) [repeatable] on LOCATION | LOCATION
-    fn parseDirectiveDefinition(self: *SchemaParser, directives: *std.StringHashMap(schema.DirectiveDefinition)) SchemaParseError!void {
+    fn parseDirectiveDefinition(self: *SchemaParser, directives: *std.StringHashMap(schema.DirectiveDefinition), description: ?[]const u8) SchemaParseError!void {
         try self.expectKeyword("directive");
         try self.expect(.at);
         const name = try self.expectName();
 
         var def = schema.DirectiveDefinition.init(self.allocator, name);
+        def.description = description;
         errdefer def.deinit(self.allocator);
 
         // Arguments
@@ -400,9 +429,18 @@ pub const SchemaParser = struct {
     }
 
     fn parseFieldDefinition(self: *SchemaParser) SchemaParseError!schema.Field {
+        // Optional leading description.
+        var description: ?[]const u8 = null;
+        if (self.current.kind == .string or self.current.kind == .block_string) {
+            description = try self.allocator.dupe(u8, self.current.text);
+            try self.advance();
+        }
+        errdefer if (description) |d| self.allocator.free(d);
+
         const name = try self.expectName();
 
         var field = schema.Field.init(self.allocator, name, schema.TypeRef.named(""));
+        field.description = description;
         errdefer field.deinit(self.allocator);
 
         // Arguments
@@ -742,4 +780,34 @@ test "schema parser field deprecation" {
     const field = s.query_type.getField("old").?;
     try std.testing.expect(field.deprecation_reason != null);
     try std.testing.expectEqualStrings("use new", field.deprecation_reason.?);
+}
+
+test "schema parser descriptions" {
+    const allocator = std.testing.allocator;
+    const sdl =
+        \\"The query root"
+        \\schema { query: Query }
+        \\"A user type"
+        \\type Query {
+        \\  "Greets a user"
+        \\  hello: String
+        \\}
+        \\"Role enum"
+        \\enum Role {
+        \\  "Administrator"
+        \\  ADMIN
+        \\  USER
+        \\}
+    ;
+    var parser = try SchemaParser.init(allocator, sdl);
+    defer parser.deinit();
+    var s = try parser.parseSchema();
+    defer s.deinit();
+
+    try std.testing.expectEqualStrings("A user type", s.query_type.description.?);
+    const hello = s.query_type.getField("hello").?;
+    try std.testing.expectEqualStrings("Greets a user", hello.description.?);
+    const role = s.getType("Role").?;
+    try std.testing.expectEqualStrings("Role enum", role.description.?);
+    try std.testing.expectEqualStrings("Administrator", role.kind.enum_type.values.get("ADMIN").?.description.?);
 }

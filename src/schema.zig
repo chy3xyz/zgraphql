@@ -42,6 +42,7 @@ pub const DirectiveDefinition = struct {
 
     pub fn deinit(self: *DirectiveDefinition, allocator: std.mem.Allocator) void {
         self.locations.deinit();
+        if (self.description) |d| allocator.free(d);
         var aiter = self.arguments.iterator();
         while (aiter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
@@ -56,6 +57,7 @@ pub const Schema = struct {
     query_type: *Type,
     mutation_type: ?*Type = null,
     subscription_type: ?*Type = null,
+    description: ?[]const u8 = null,
     types: std.StringHashMap(*Type),
     directives: std.StringHashMap(DirectiveDefinition),
 
@@ -79,6 +81,7 @@ pub const Schema = struct {
     }
 
     pub fn deinit(self: *Schema) void {
+        if (self.description) |d| self.allocator.free(d);
         var iter = self.types.iterator();
         while (iter.next()) |entry| {
             entry.value_ptr.*.deinit(self.allocator);
@@ -182,6 +185,7 @@ pub const Type = struct {
     };
 
     pub fn deinit(self: *Type, allocator: std.mem.Allocator) void {
+        if (self.description) |d| allocator.free(d);
         switch (self.kind) {
             .object => |*obj| obj.deinit(allocator),
             .interface => |*iface| iface.deinit(allocator),
@@ -309,6 +313,7 @@ pub const EnumType = struct {
         var iter = self.values.iterator();
         while (iter.next()) |entry| {
             allocator.free(entry.key_ptr.*);
+            if (entry.value_ptr.description) |d| allocator.free(d);
         }
         self.values.deinit();
     }
@@ -398,6 +403,7 @@ pub const Field = struct {
 
     pub fn deinit(self: *Field, allocator: std.mem.Allocator) void {
         self.field_type.deinit(allocator);
+        if (self.description) |d| allocator.free(d);
         if (self.deprecation_reason) |r| allocator.free(r);
         var iter = self.arguments.iterator();
         while (iter.next()) |entry| {
@@ -417,6 +423,7 @@ pub const InputValue = struct {
 
     pub fn deinit(self: *InputValue, allocator: std.mem.Allocator) void {
         self.value_type.deinit(allocator);
+        if (self.description) |d| allocator.free(d);
         if (self.default_value) |*dv| dv.deinit(allocator);
     }
 };

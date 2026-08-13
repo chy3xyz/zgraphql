@@ -8,6 +8,9 @@ pub const Introspection = struct {
         var result = Value.initObject(allocator);
         errdefer result.deinit(allocator);
 
+        // description (schema-level)
+        try result.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, schema_def.description));
+
         // types
         var types_list = Value.initList(allocator);
         errdefer types_list.deinit(allocator);
@@ -142,8 +145,9 @@ pub const Introspection = struct {
                 while (eviter.next()) |entry| {
                     var ev_obj = Value.initObject(allocator);
                     try ev_obj.data.object.put(try allocator.dupe(u8, "name"), Value.fromString(allocator, try allocator.dupe(u8, entry.value_ptr.*.name)));
-                    try ev_obj.data.object.put(try allocator.dupe(u8, "description"), Value.fromNull(allocator));
+                    try ev_obj.data.object.put(try allocator.dupe(u8, "description"), try nullableString(allocator, entry.value_ptr.*.description));
                     try ev_obj.data.object.put(try allocator.dupe(u8, "isDeprecated"), Value.fromBool(allocator, false));
+                    try ev_obj.data.object.put(try allocator.dupe(u8, "deprecationReason"), Value.fromNull(allocator));
                     try enum_values.data.list.append(ev_obj);
                 }
                 try obj.data.object.put(try allocator.dupe(u8, "enumValues"), enum_values);
