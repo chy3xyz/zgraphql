@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0] - 2026-08-13
 
 ### Fixed
 - **Subscription cross-allocator safety**: `Executor.executeSubscription`'s `next()` used to mix the caller's allocator (outer result) with the Executor's allocator (sub-selection data), so passing a different allocator would corrupt the heap. Sub-selection results are now cloned into the caller's allocator so the returned Value tree is uniformly owned.
@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Validator spec gaps**: added UniqueOperationNames, LoneAnonymousOperation, NoUnusedFragments, VariablesAreInputTypes, constant variable defaults, and OverlappingFieldsCanBeMerged.
 - **WS protocol**: handle `connection_terminate`.
 - **`HttpCacheBackend.setImpl`/`deleteImpl` swallowed non-2xx status**: the HTTP status from `client.fetch` was discarded, so a failed cache write (404/500/503) silently reported success. Non-2xx now returns `error.CacheWriteFailed`.
-- **Subscription allocator contract documented + asserted**: `SubscriptionStream.next` results from `Executor.executeSubscription` must use the Executor's allocator; a debug-mode assertion now catches a mismatch instead of corrupting the heap silently.
 - **`DataLoader.loadBatched` was broken dead code**: it used the removed `std.ArrayList.init` API and the old `Value.clone()`/`Value.deinit()` signatures, and had a malformed double-`!` return type. It now compiles and passes a fast-path test.
 - **`DistributedCache.setValue` was broken dead code**: it accessed the removed `value.allocator` field and called `value.toJson()` without an allocator. Now uses `self.allocator`.
 - **`ResponseCache.prune` / `QueryPlanCache.prune` / `RateLimiter.prune` were broken dead code**: `std.ArrayList.init` + `try dupe` in a `void` function (would not compile). Now use `std.array_list.Managed` and degrade gracefully on OOM.
@@ -142,6 +141,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Graceful Shutdown**: SIGINT/SIGTERM handling with active request draining
 - **Zero External Dependencies**: Pure Zig standard library
 
+[0.7.0]: https://github.com/chy3xyz/zgraphql/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/chy3xyz/zgraphql/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/chy3xyz/zgraphql/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/chy3xyz/zgraphql/compare/v0.4.0...v0.4.1
